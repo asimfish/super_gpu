@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+
+# Local controller state and experiment artifacts
+.super_gpu/
+*.sqlite
+*.sqlite3
+*.db
+*.pid
+*.log
+
+# Real cluster configuration may contain private host aliases and paths.
+config.json
+nodes.json
+
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.gitnexus/

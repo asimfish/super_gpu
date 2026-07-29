@@ -1,0 +1,4 @@
+interface:
+  display_name: "Super GPU Orchestrator"
+  short_description: "Schedule and monitor multi-server GPU experiments"
+  default_prompt: "Use $super-gpu to validate my GPU cluster, schedule this experiment plan, and monitor it to completion."

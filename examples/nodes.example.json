@@ -1,0 +1,45 @@
+{
+  "database": "~/.super_gpu/state.sqlite3",
+  "poll_interval": 5,
+  "lease_ttl": 60,
+  "default_memory_mib": 16384,
+  "default_gpu_utilization": 70,
+  "max_parallel": 32,
+  "api_host": "127.0.0.1",
+  "api_port": 8765,
+  "nodes": [
+    {
+      "name": "main-a100",
+      "ssh": "main-a100",
+      "role": "dedicated",
+      "priority": 100,
+      "workspace": "/data/experiments/project",
+      "labels": ["a100", "primary"],
+      "policy": {
+        "max_gpu_utilization": 94,
+        "max_memory_used_ratio": 0.94,
+        "reserve_memory_mib": 2048,
+        "stabilization_samples": 1,
+        "allow_colocation": true,
+        "max_jobs_per_gpu": 2
+      }
+    },
+    {
+      "name": "shared-4090",
+      "ssh": "shared-4090",
+      "role": "shared",
+      "priority": 10,
+      "workspace": "/data/experiments/project",
+      "labels": ["4090", "shared"],
+      "policy": {
+        "max_gpu_utilization": 30,
+        "max_memory_used_ratio": 0.3,
+        "reserve_memory_mib": 4096,
+        "stabilization_samples": 3,
+        "allow_colocation": false,
+        "max_jobs_per_gpu": 1,
+        "cooldown_seconds": 20
+      }
+    }
+  ]
+}

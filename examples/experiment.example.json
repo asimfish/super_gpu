@@ -1,0 +1,47 @@
+{
+  "name": "learning-rate-sweep",
+  "max_parallel": 12,
+  "defaults": {
+    "timeout": 86400,
+    "max_retries": 1,
+    "retry_delay": 30,
+    "resources": {
+      "gpus": 1,
+      "memory_mib": "auto",
+      "gpu_utilization": "auto",
+      "duration_seconds": "auto"
+    }
+  },
+  "jobs": [
+    {
+      "name": "baseline",
+      "command": "python3 train.py --config configs/base.yaml --lr 1e-4",
+      "priority": 20,
+      "params": {
+        "learning_rate": 0.0001,
+        "batch_size": 16
+      }
+    },
+    {
+      "name": "lr-3e-4",
+      "command": "python3 train.py --config configs/base.yaml --lr 3e-4",
+      "priority": 10,
+      "params": {
+        "learning_rate": 0.0003,
+        "batch_size": 16
+      }
+    },
+    {
+      "name": "two-gpu-eval",
+      "command": "torchrun --nproc_per_node=2 evaluate.py --checkpoint outputs/best.pt",
+      "dependencies": ["baseline"],
+      "required_labels": ["a100"],
+      "resources": {
+        "gpus": 2,
+        "memory_mib": 12288,
+        "gpu_utilization": 55,
+        "allow_colocation": false
+      }
+    }
+  ]
+}
