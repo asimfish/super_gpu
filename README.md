@@ -74,6 +74,11 @@ python3 -m venv .venv
 cp examples/nodes.example.json config.json
 # 修改节点别名、role、workspace 和阈值
 
+# 已有 gpumgr 节点清单时，可生成默认全部为 shared 的私有配置
+.venv/bin/super-gpu import-gpumgr \
+  --source ~/.config/gpumgr/nodes.json \
+  --output ~/.config/super_gpu/config.json
+
 .venv/bin/super-gpu --config config.json validate \
   --plan examples/experiment.example.json
 .venv/bin/super-gpu --config config.json doctor
@@ -202,6 +207,35 @@ SUPER_GPU_URL=http://127.0.0.1:8765 \
 - `experiment_jobs`
 - `experiment_cancel`
 - `scheduler_events`
+- `anomaly_report`
+
+## 异常占用巡检
+
+controller 会持续识别“仍有计算进程和显存占用，但 GPU Util 长时间接近
+0%”的卡。默认策略只报告，不执行终止：
+
+```bash
+export SUPER_GPU_WATCHDOG_ENABLED=true
+export SUPER_GPU_WATCHDOG_LOW_UTILIZATION=3
+export SUPER_GPU_WATCHDOG_MIN_MEMORY_MIB=1024
+export SUPER_GPU_WATCHDOG_GRACE_SECONDS=900
+export SUPER_GPU_WATCHDOG_MIN_RUNTIME_SECONDS=1800
+export SUPER_GPU_WATCHDOG_ACTION=report
+```
+
+通过 `GET /api/anomalies`、MCP `anomaly_report` 或 `/api/state` 的
+`anomalies` 字段查看结果。外部进程只会报告，绝不会由 super_gpu 自动
+发送信号；需要人工处理时在 gpumgr 中核对用户、命令和启动时间后操作。
+
+只有显式设置下面的策略，controller 才会自动请求取消自己启动并持有有效
+租约的独占任务：
+
+```bash
+export SUPER_GPU_WATCHDOG_ACTION=cancel_managed
+```
+
+自动取消仍需同时满足最短运行时间、连续低利用率宽限期、显存阈值、可见
+GPU 进程和独占租约。controller 重启会重置宽限期，避免因旧状态误杀任务。
 
 HTTP MCP：
 
@@ -227,6 +261,7 @@ SUPER_GPU_URL=http://127.0.0.1:8765 \
 | POST | `/api/jobs/<id>/cancel` | 取消任务 |
 | POST | `/api/scan` | 立即刷新 GPU 状态 |
 | GET | `/api/events` | 调度事件 |
+| GET | `/api/anomalies` | 当前低利用率显存占用与 watchdog 策略 |
 
 服务默认只监听 loopback。绑定 `0.0.0.0` 时必须设置：
 

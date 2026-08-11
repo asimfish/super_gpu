@@ -11,7 +11,7 @@ from typing import Any
 
 from .api import serve
 from .client import SuperGPUClient
-from .config import load_config, load_plan
+from .config import import_gpumgr_inventory, load_config, load_plan
 from .models import ExperimentPlan
 from .monitor import ClusterMonitor
 from .scheduler import Scheduler
@@ -194,6 +194,35 @@ def cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_gpumgr(args: argparse.Namespace) -> int:
+    output = Path(args.output).expanduser()
+    if output.exists() and not args.force:
+        raise ValueError(f"refusing to overwrite existing config: {output}; use --force")
+    payload = import_gpumgr_inventory(
+        args.source,
+        role=args.role,
+        workspace=args.workspace,
+        database=args.database,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    temporary.replace(output)
+    _print(
+        {
+            "ok": True,
+            "output": str(output),
+            "nodes": len(payload["nodes"]),
+            "role": args.role,
+        }
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="super-gpu",
@@ -258,6 +287,27 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=100)
     _remote_args(events)
     events.set_defaults(func=cmd_events)
+
+    import_gpumgr = sub.add_parser(
+        "import-gpumgr",
+        help="create a private super_gpu config from gpumgr's node inventory",
+    )
+    import_gpumgr.add_argument(
+        "--source",
+        default=os.environ.get(
+            "GPUMGR_CONFIG",
+            str(Path.home() / ".config" / "gpumgr" / "nodes.json"),
+        ),
+    )
+    import_gpumgr.add_argument(
+        "--output",
+        default=str(Path.home() / ".config" / "super_gpu" / "config.json"),
+    )
+    import_gpumgr.add_argument("--role", choices=["shared", "dedicated"], default="shared")
+    import_gpumgr.add_argument("--workspace", default="~/.super_gpu/work")
+    import_gpumgr.add_argument("--database", default="~/.super_gpu/state.sqlite3")
+    import_gpumgr.add_argument("--force", action="store_true")
+    import_gpumgr.set_defaults(func=cmd_import_gpumgr)
     return parser
 
 

@@ -14,13 +14,20 @@ from .transport import CommandTransport
 
 GPU_MARKER = "__SUPER_GPU_GPU__"
 PROCESS_MARKER = "__SUPER_GPU_PROCESS__"
+PROCESS_USER_MARKER = "__SUPER_GPU_PROCESS_USER__"
 QUERY_SCRIPT = f"""
 set +e
 echo {GPU_MARKER}
 nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.free,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits
 gpu_rc=$?
 echo {PROCESS_MARKER}
-nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null
+proc_out=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null)
+printf '%s\n' "$proc_out"
+echo {PROCESS_USER_MARKER}
+printf '%s\n' "$proc_out" | awk -F, '{{gsub(/[[:space:]]/, "", $2); if ($2 ~ /^[0-9]+$/) print $2}}' | sort -u | while read -r pid; do
+  user=$(ps -o user= -p "$pid" 2>/dev/null | awk '{{$1=$1; print}}')
+  printf '%s,%s\n' "$pid" "$user"
+done
 exit "$gpu_rc"
 """.strip()
 
@@ -42,6 +49,7 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
     section = ""
     gpu_rows: list[str] = []
     process_rows: list[str] = []
+    process_user_rows: list[str] = []
     for raw in stdout.splitlines():
         line = raw.strip()
         if line == GPU_MARKER:
@@ -50,13 +58,26 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
         if line == PROCESS_MARKER:
             section = "process"
             continue
+        if line == PROCESS_USER_MARKER:
+            section = "process_user"
+            continue
         if not line:
             continue
         if section == "gpu":
             gpu_rows.append(line)
         elif section == "process":
             process_rows.append(line)
+        elif section == "process_user":
+            process_user_rows.append(line)
 
+    process_users: dict[int, str] = {}
+    for row in process_user_rows:
+        parts = [part.strip() for part in row.split(",", 1)]
+        if len(parts) != 2:
+            continue
+        pid = _number(parts[0])
+        if pid is not None:
+            process_users[int(pid)] = parts[1]
     processes: dict[str, list[GpuProcess]] = defaultdict(list)
     for row in process_rows:
         parts = [part.strip() for part in row.split(",", 3)]
@@ -71,6 +92,7 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
                 pid=int(pid),
                 process_name=parts[2],
                 used_memory_mib=int(memory),
+                user=process_users.get(int(pid), ""),
             )
         )
 

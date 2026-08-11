@@ -60,3 +60,13 @@ grants server credentials.
 - `experiment_jobs`
 - `experiment_cancel`
 - `scheduler_events`
+- `anomaly_report`
+
+## Watchdog authority
+
+- Treat unmanaged idle-GPU findings as report-only. Never turn a telemetry PID
+  into an automatic signal action.
+- `cancel_managed` may cancel only a job owned by the active scheduler database
+  after its configured runtime and grace period.
+- Enabling `SUPER_GPU_WATCHDOG_ACTION=cancel_managed` is a destructive policy
+  change and requires explicit operator intent.

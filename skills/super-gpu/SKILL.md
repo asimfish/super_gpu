@@ -30,11 +30,14 @@ admission, and supervise the plan through a terminal state.
 3. Preserve conservative shared-node defaults unless the user explicitly
    approves a change. Never infer that an idle-looking shared node is
    dedicated.
-4. Use SSH aliases or destinations already authorized by the user. Never
+4. When gpumgr already owns the node inventory, generate the private config
+   with `super-gpu import-gpumgr`; imported nodes must remain `shared` until the
+   operator explicitly classifies them.
+5. Use SSH aliases or destinations already authorized by the user. Never
    fabricate credentials, copy private keys, or commit private host data.
-5. Convert the experiment description into a plan that satisfies the JSON
+6. Convert the experiment description into a plan that satisfies the JSON
    Schema. Preserve commands and scientific parameters exactly.
-6. Prefer explicit `resources.memory_mib` for a never-before-run
+7. Prefer explicit `resources.memory_mib` for a never-before-run
    memory-sensitive workload. Use `"auto"` when a conservative first-run
    estimate is acceptable; explain that later runs improve from measured
    history.
@@ -94,6 +97,9 @@ After submission:
    merely to make a job pass.
 6. Cancel only when explicitly requested or when the user explicitly
    authorized cleanup of this plan.
+7. Query `anomaly_report` during supervision. Unmanaged findings are
+   report-only. Enable `cancel_managed` only when the operator explicitly
+   authorizes automatic cleanup of scheduler-owned jobs.
 
 ## Report the outcome
 

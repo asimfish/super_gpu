@@ -9,6 +9,7 @@ import traceback
 from typing import Any
 
 from .estimator import ResourceEstimator
+from .guardian import IdleGpuGuardian
 from .models import (
     ExperimentPlan,
     JobSpec,
@@ -33,6 +34,7 @@ class Scheduler:
         runner: PersistentRunner | None = None,
         estimator: ResourceEstimator | None = None,
         placement: PlacementEngine | None = None,
+        guardian: IdleGpuGuardian | None = None,
     ) -> None:
         self.config = config
         self.store = store or StateStore(config.database)
@@ -40,6 +42,10 @@ class Scheduler:
         self.runner = runner or PersistentRunner(self.monitor.transport)
         self.estimator = estimator or ResourceEstimator(config, self.store)
         self.placement = placement or PlacementEngine(config, self.monitor)
+        self.guardian = guardian or IdleGpuGuardian()
+        # Idle accumulation must survive controller restarts; the guardian's
+        # stale-gap handling keeps the blind window from counting as idle time.
+        self.guardian.restore_observations(self.store.load_watchdog_observations())
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{new_id('controller')}"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -47,6 +53,7 @@ class Scheduler:
         self._last_tick = 0.0
         self._last_error = ""
         self._tick_count = 0
+        self._node_reachability: dict[str, bool] = {}
 
     def submit(self, plan: ExperimentPlan) -> dict[str, Any]:
         return self.store.submit_plan(plan)
@@ -98,7 +105,9 @@ class Scheduler:
             raise RuntimeError("scheduler controller lock was lost")
         snapshots = self.monitor.collect_all()
         self.store.save_snapshots(snapshots)
+        self._track_reachability(snapshots)
         self._reconcile_running(snapshots)
+        self._inspect_watchdog(snapshots)
         for blocked in self.store.fail_blocked_dependencies():
             self.store.add_event(
                 "job_blocked",
@@ -111,6 +120,72 @@ class Scheduler:
             self._last_tick = time.time()
             self._last_error = ""
             self._tick_count += 1
+
+    def _track_reachability(self, snapshots: list[NodeSnapshot]) -> None:
+        # The first pass after a (re)start only records a baseline so that a
+        # node that was already offline is not re-announced on every restart.
+        first_pass = not self._node_reachability
+        for snapshot in snapshots:
+            previous = self._node_reachability.get(snapshot.node)
+            self._node_reachability[snapshot.node] = snapshot.reachable
+            if first_pass or previous is None or previous == snapshot.reachable:
+                continue
+            if snapshot.reachable:
+                self.store.add_event(
+                    "node_online",
+                    f"node {snapshot.node} is reachable again",
+                    {"node": snapshot.node, "gpus": len(snapshot.gpus)},
+                )
+            else:
+                self.store.add_event(
+                    "node_offline",
+                    f"node {snapshot.node} became unreachable",
+                    {"node": snapshot.node, "error": (snapshot.error or "")[:500]},
+                )
+
+    def _inspect_watchdog(self, snapshots: list[NodeSnapshot]) -> None:
+        jobs = self.store.list_jobs(
+            statuses=["starting", "running", "cancelling"],
+            limit=10000,
+        )
+        result = self.guardian.inspect(
+            snapshots,
+            self.store.leases(active_only=True),
+            jobs,
+        )
+        for finding in result.newly_active:
+            self.store.add_event(
+                "watchdog_anomaly_detected",
+                (
+                    f"GPU {finding['node']}:{finding['gpu_index']} has sustained "
+                    "low utilization while holding memory"
+                ),
+                finding,
+            )
+        for finding_id in result.resolved_ids:
+            self.store.add_event(
+                "watchdog_anomaly_resolved",
+                f"watchdog anomaly {finding_id} resolved",
+                {"finding_id": finding_id},
+            )
+        jobs_by_id = {str(job["id"]): job for job in jobs}
+        for job_id in result.cancel_job_ids:
+            job = jobs_by_id.get(job_id)
+            if not job or job.get("cancel_requested"):
+                continue
+            updated = self.store.request_cancel(job_id)
+            if updated.get("cancel_requested"):
+                self.store.add_event(
+                    "watchdog_cancel_requested",
+                    f"watchdog requested cancellation of managed job {job['name']}",
+                    {
+                        "job_id": job_id,
+                        "plan_id": job.get("plan_id"),
+                        "node": job.get("node"),
+                        "gpus": job.get("gpus", []),
+                    },
+                )
+        self.store.save_watchdog_observations(self.guardian.export_observations())
 
     def _reconcile_running(self, snapshots: list[NodeSnapshot]) -> None:
         snapshot_by_node = {snapshot.node: snapshot for snapshot in snapshots}
@@ -419,4 +494,5 @@ class Scheduler:
                 "poll_interval": self.config.poll_interval,
                 "active_jobs": self.store.active_count(),
                 "pending_jobs": len(self.store.list_jobs(statuses=["pending"], limit=10000)),
+                "watchdog": self.guardian.status(),
             }

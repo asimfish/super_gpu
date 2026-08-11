@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
-.venv/
+.venv*/
 venv/
 build/
 dist/

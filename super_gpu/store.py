@@ -117,6 +117,14 @@ CREATE TABLE IF NOT EXISTS controller_lock (
   owner TEXT NOT NULL,
   expires_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS watchdog_observations (
+  key TEXT PRIMARY KEY,
+  node TEXT NOT NULL,
+  first_seen REAL NOT NULL,
+  last_seen REAL NOT NULL,
+  samples INTEGER NOT NULL
+);
 """
 
 
@@ -739,6 +747,39 @@ class StateStore:
                         fingerprint,
                     ),
                 )
+
+    def save_watchdog_observations(self, observations: list[dict[str, Any]]) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM watchdog_observations")
+                conn.executemany(
+                    """
+                    INSERT INTO watchdog_observations(key, node, first_seen, last_seen, samples)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(observation["key"]),
+                            str(observation["node"]),
+                            float(observation["first_seen"]),
+                            float(observation["last_seen"]),
+                            int(observation["samples"]),
+                        )
+                        for observation in observations
+                    ],
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def load_watchdog_observations(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT key, node, first_seen, last_seen, samples FROM watchdog_observations"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_event(self, kind: str, message: str, payload: dict[str, Any] | None = None) -> None:
         with self.connect() as conn:

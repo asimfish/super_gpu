@@ -83,6 +83,7 @@ def dashboard_state(scheduler: Scheduler) -> dict[str, Any]:
         "jobs": jobs,
         "events": scheduler.store.list_events(limit=100),
         "leases": leases,
+        "anomalies": scheduler.guardian.findings(),
     }
 
 
@@ -179,6 +180,16 @@ class SuperGPUHandler(BaseHTTPRequestHandler):
                 limit=int(params.get("limit", ["100"])[0])
             )
             self._json(200, {"ok": True, "events": events})
+            return
+        if path == "/api/anomalies":
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "watchdog": self.server.scheduler.guardian.status(),
+                    "anomalies": self.server.scheduler.guardian.findings(),
+                },
+            )
             return
         if path == "/" or path == "/index.html":
             self._static("index.html")

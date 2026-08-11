@@ -8,14 +8,18 @@ import urllib.request
 import pytest
 
 from super_gpu.api import create_server
-from super_gpu.config import config_from_dict, load_config, load_plan
+from super_gpu.cli import main as cli_main
+from super_gpu.config import config_from_dict, import_gpumgr_inventory, load_config, load_plan
 from super_gpu.estimator import ResourceEstimator
+from super_gpu.guardian import IdleGpuGuardian, WatchdogPolicy
 from super_gpu.models import (
     ExperimentPlan,
+    GpuProcess,
     GpuSnapshot,
     JobSpec,
     NodeConfig,
     NodeSnapshot,
+    Placement,
     ResourceEstimate,
     RunnerHandle,
 )
@@ -75,6 +79,19 @@ def _snapshot(node="gpu-main", *, util=0, used=0, total=24576, role="dedicated")
     )
 
 
+def _idle_snapshot(node="gpu-main", *, util=0, used=8192, role="dedicated"):
+    snapshot = _snapshot(node, util=util, used=used, role=role)
+    snapshot.gpus[0].processes = [
+        GpuProcess(
+            pid=4321,
+            process_name="python train.py",
+            used_memory_mib=max(1, used - 64),
+            user="researcher",
+        )
+    ]
+    return snapshot
+
+
 def test_example_config_and_plan_validate(tmp_path):
     config = load_config("examples/nodes.example.json")
     plan = load_plan("examples/experiment.example.json")
@@ -109,6 +126,65 @@ def test_example_config_and_plan_validate(tmp_path):
         )
 
 
+def test_import_gpumgr_inventory_defaults_to_shared_and_writes_private_config(
+    tmp_path,
+) -> None:
+    source = tmp_path / "nodes.json"
+    source.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "name": "a100-a",
+                        "ssh": "a100-a",
+                        "vendor": "nvidia",
+                        "gpus": 8,
+                        "can_vllm": True,
+                        "note": "private endpoint is intentionally not copied",
+                    },
+                    {
+                        "name": "rtx-a",
+                        "ssh": "rtx-a",
+                        "vendor": "rtx4090",
+                        "gpus": 1,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = import_gpumgr_inventory(source)
+    config = config_from_dict(payload)
+
+    assert [node.role for node in config.nodes] == ["shared", "shared"]
+    assert config.nodes[0].labels == ["nvidia", "gpu-count-8", "vllm"]
+    assert config.nodes[1].labels == ["rtx4090", "gpu-count-1"]
+    assert "note" not in payload["nodes"][0]
+
+    output = tmp_path / "private" / "config.json"
+    assert cli_main(
+        [
+            "import-gpumgr",
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert load_config(output).nodes[0].role == "shared"
+    assert cli_main(
+        [
+            "import-gpumgr",
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+        ]
+    ) == 1
+
+
 def test_parse_nvidia_output_with_processes():
     raw = """
 __SUPER_GPU_GPU__
@@ -116,12 +192,242 @@ __SUPER_GPU_GPU__
 1, GPU-b, NVIDIA A100-SXM4-80GB, 0, 100, 80900, 81000, 35, [Not Supported]
 __SUPER_GPU_PROCESS__
 GPU-a, 1234, python3, 41000
+__SUPER_GPU_PROCESS_USER__
+1234,researcher
 """
     gpus = parse_nvidia_output(raw)
     assert len(gpus) == 2
     assert gpus[0].utilization == 71
     assert gpus[0].processes[0].pid == 1234
+    assert gpus[0].processes[0].user == "researcher"
     assert gpus[1].power_w is None
+
+
+def test_watchdog_reports_unmanaged_idle_gpu_without_cancellation():
+    guardian = IdleGpuGuardian(
+        WatchdogPolicy(
+            low_utilization_threshold=3,
+            min_memory_used_mib=1024,
+            grace_seconds=10,
+            min_runtime_seconds=0,
+            action="cancel_managed",
+        )
+    )
+    snapshot = _idle_snapshot()
+
+    observing = guardian.inspect([snapshot], [], [], now=100)
+    assert observing.findings[0]["status"] == "observing"
+    assert observing.findings[0]["kind"] == "unmanaged_idle"
+    assert observing.cancel_job_ids == []
+
+    active = guardian.inspect([snapshot], [], [], now=111)
+    assert active.findings[0]["status"] == "active"
+    assert active.findings[0]["automatic_action"] == "none"
+    assert active.cancel_job_ids == []
+
+    resolved = guardian.inspect([_idle_snapshot(util=40)], [], [], now=112)
+    assert resolved.findings == []
+    assert resolved.resolved_ids == [active.findings[0]["id"]]
+
+
+def test_watchdog_cancels_only_exclusive_managed_job_after_grace():
+    policy = WatchdogPolicy(
+        low_utilization_threshold=3,
+        min_memory_used_mib=1024,
+        grace_seconds=10,
+        min_runtime_seconds=30,
+        action="cancel_managed",
+    )
+    jobs = [
+        {
+            "id": "job-a",
+            "name": "job-a",
+            "status": "running",
+            "started_at": 50.0,
+            "cancel_requested": False,
+        },
+        {
+            "id": "job-b",
+            "name": "job-b",
+            "status": "running",
+            "started_at": 50.0,
+            "cancel_requested": False,
+        },
+    ]
+    lease_a = {"job_id": "job-a", "node": "gpu-main", "gpu_index": 0}
+
+    guardian = IdleGpuGuardian(policy)
+    guardian.inspect([_idle_snapshot()], [lease_a], jobs, now=100)
+    result = guardian.inspect([_idle_snapshot()], [lease_a], jobs, now=111)
+    assert result.cancel_job_ids == ["job-a"]
+    assert result.findings[0]["automatic_action"] == "cancel_managed"
+
+    colocated = IdleGpuGuardian(policy)
+    shared_leases = [
+        lease_a,
+        {"job_id": "job-b", "node": "gpu-main", "gpu_index": 0},
+    ]
+    colocated.inspect([_idle_snapshot()], shared_leases, jobs, now=100)
+    result = colocated.inspect([_idle_snapshot()], shared_leases, jobs, now=111)
+    assert result.findings[0]["kind"] == "colocated_idle"
+    assert result.cancel_job_ids == []
+
+
+def _watchdog_policy(**overrides):
+    defaults = dict(
+        low_utilization_threshold=3,
+        min_memory_used_mib=1024,
+        grace_seconds=10,
+        min_runtime_seconds=0,
+        action="report",
+    )
+    defaults.update(overrides)
+    return WatchdogPolicy(**defaults)
+
+
+def test_watchdog_idle_timer_survives_process_churn():
+    guardian = IdleGpuGuardian(_watchdog_policy())
+    first = guardian.inspect([_idle_snapshot()], [], [], now=100)
+
+    churned = _idle_snapshot()
+    churned.gpus[0].processes[0].pid = 9999
+    active = guardian.inspect([churned], [], [], now=111)
+
+    assert active.findings[0]["id"] == first.findings[0]["id"]
+    assert active.findings[0]["status"] == "active"
+    assert active.findings[0]["idle_seconds"] == pytest.approx(11.0)
+
+
+def test_watchdog_idle_timer_freezes_across_sampling_gap():
+    guardian = IdleGpuGuardian(_watchdog_policy())
+    guardian.inspect([_idle_snapshot()], [], [], now=100)
+
+    resumed = guardian.inspect([_idle_snapshot()], [], [], now=140)
+    assert resumed.findings[0]["status"] == "observing"
+    assert resumed.findings[0]["idle_seconds"] == pytest.approx(0.0)
+
+    active = guardian.inspect([_idle_snapshot()], [], [], now=151)
+    assert active.findings[0]["status"] == "active"
+    assert active.findings[0]["idle_seconds"] == pytest.approx(11.0)
+
+
+def test_watchdog_keeps_observations_while_node_unreachable():
+    guardian = IdleGpuGuardian(_watchdog_policy())
+    started = guardian.inspect([_idle_snapshot()], [], [], now=100)
+
+    offline = _snapshot()
+    offline.reachable = False
+    during_outage = guardian.inspect([offline], [], [], now=105)
+    assert during_outage.findings == []
+    assert during_outage.resolved_ids == []
+
+    recovered = guardian.inspect([_idle_snapshot()], [], [], now=112)
+    assert recovered.findings[0]["id"] == started.findings[0]["id"]
+    assert recovered.findings[0]["status"] == "active"
+
+
+def test_watchdog_observation_state_survives_restart(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    policy = _watchdog_policy()
+    guardian = IdleGpuGuardian(policy)
+    guardian.inspect([_idle_snapshot()], [], [], now=100)
+    guardian.inspect([_idle_snapshot()], [], [], now=108)
+    store.save_watchdog_observations(guardian.export_observations())
+
+    reborn = IdleGpuGuardian(policy)
+    reborn.restore_observations(store.load_watchdog_observations())
+    resumed = reborn.inspect([_idle_snapshot()], [], [], now=158)
+    assert resumed.findings[0]["idle_seconds"] == pytest.approx(8.0)
+    active = reborn.inspect([_idle_snapshot()], [], [], now=161)
+    assert active.findings[0]["status"] == "active"
+
+
+def test_scheduler_wires_watchdog_observation_persistence(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    store.save_watchdog_observations(
+        [{"key": "k1", "node": "gpu-main", "first_seen": 1.0, "last_seen": 2.0, "samples": 3}]
+    )
+
+    scheduler = Scheduler(config, store=store)
+    assert scheduler.guardian.export_observations() == [
+        {"key": "k1", "node": "gpu-main", "first_seen": 1.0, "last_seen": 2.0, "samples": 3}
+    ]
+
+    scheduler._inspect_watchdog([_idle_snapshot()])
+    persisted = store.load_watchdog_observations()
+    assert len(persisted) == 1
+    assert persisted[0]["node"] == "gpu-main"
+    assert persisted[0]["key"] != "k1"
+
+
+def test_scheduler_emits_node_reachability_transition_events(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    scheduler = Scheduler(config, store=store)
+    up = _snapshot()
+    down = _snapshot()
+    down.reachable = False
+    down.error = "ssh timeout"
+
+    scheduler._track_reachability([up])
+    scheduler._track_reachability([down])
+    scheduler._track_reachability([down])
+    scheduler._track_reachability([up])
+
+    kinds = [event["kind"] for event in store.list_events()]
+    assert kinds.count("node_offline") == 1
+    assert kinds.count("node_online") == 1
+
+    rebooted = Scheduler(config, store=store)
+    rebooted._track_reachability([down])
+    kinds = [event["kind"] for event in store.list_events()]
+    assert kinds.count("node_offline") == 1
+
+
+def test_scheduler_watchdog_requests_managed_job_cancellation(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    submitted = store.submit_plan(
+        ExperimentPlan.from_dict(
+            {
+                "name": "watchdog-plan",
+                "jobs": [{"name": "idle", "command": "python train.py"}],
+            }
+        )
+    )
+    job = submitted["jobs"][0]
+    estimate = ResourceEstimate(4096, 60, None, "test", 1.0)
+    assert store.acquire_placement(
+        job["id"],
+        Placement("gpu-main", [0], 4096, 1.0, estimate),
+        config.lease_ttl,
+    )
+    store.mark_running(
+        job["id"],
+        RunnerHandle("local", "gpu-main", 1234, "/tmp/run", time.time()).as_dict(),
+    )
+    guardian = IdleGpuGuardian(
+        WatchdogPolicy(
+            low_utilization_threshold=3,
+            min_memory_used_mib=1024,
+            grace_seconds=0,
+            min_runtime_seconds=0,
+            action="cancel_managed",
+        )
+    )
+    scheduler = Scheduler(config, store=store, guardian=guardian)
+
+    scheduler._inspect_watchdog([_idle_snapshot()])
+
+    cancelled = store.get_job(job["id"])
+    assert cancelled["status"] == "cancelling"
+    assert cancelled["cancel_requested"] is True
+    assert any(
+        event["kind"] == "watchdog_cancel_requested"
+        for event in store.list_events()
+    )
 
 
 def test_shared_node_requires_stable_samples(tmp_path):
@@ -453,6 +759,12 @@ def test_dashboard_and_rest_plan_submission(tmp_path):
         state = json.loads(urllib.request.urlopen(base + "/api/state", timeout=3).read())
         assert state["ok"] is True
         assert state["snapshots"][0]["node"] == "gpu-main"
+        assert state["anomalies"] == []
+        anomalies = json.loads(
+            urllib.request.urlopen(base + "/api/anomalies", timeout=3).read()
+        )
+        assert anomalies["ok"] is True
+        assert anomalies["watchdog"]["policy"]["action"] == "report"
 
         payload = json.dumps(
             {

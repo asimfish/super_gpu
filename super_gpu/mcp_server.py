@@ -86,6 +86,11 @@ def create_mcp(
             indent=2,
         )
 
+    @mcp.tool()
+    def anomaly_report() -> str:
+        """Return sustained idle-GPU findings and the active watchdog policy."""
+        return json.dumps(client.get("/api/anomalies"), ensure_ascii=False, indent=2)
+
     return mcp
 
 
