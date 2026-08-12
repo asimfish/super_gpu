@@ -1,0 +1,124 @@
+#!/bin/bash
+# super_gpu controller management script.
+# Usage: supergpu {start|stop|restart|status|logs|open}
+set -u
+
+LABEL="com.liyufeng.super-gpu"
+SERVICE="gui/$(id -u)/${LABEL}"
+PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+URL="http://127.0.0.1:8767"
+STDOUT_LOG="${HOME}/.super_gpu/controller.stdout.log"
+STDERR_LOG="${HOME}/.super_gpu/controller.stderr.log"
+
+say() { printf '%s\n' "$*"; }
+
+health() {
+  curl --silent --max-time 5 "${URL}/health" 2>/dev/null
+}
+
+is_loaded() {
+  launchctl print "${SERVICE}" >/dev/null 2>&1
+}
+
+wait_ready() {
+  # A fresh instance waits for the previous database lease to expire
+  # (roughly 1-2 minutes) before it can take over. Poll patiently.
+  say "Waiting for the controller (lease takeover usually needs 1-2 min)..."
+  for _ in $(seq 1 36); do
+    body="$(health)"
+    if [ -n "${body}" ] && printf '%s' "${body}" | grep -q '"ok": true'; then
+      say "OK - controller ready: ${URL}"
+      return 0
+    fi
+    sleep 5
+  done
+  say "WARN - not ready within 3 min. Check 'supergpu logs' or retry 'supergpu status'."
+  return 1
+}
+
+cmd_start() {
+  if is_loaded; then
+    say "Service already loaded; nothing to do."
+  else
+    launchctl bootstrap "gui/$(id -u)" "${PLIST}" || { say "ERROR - bootstrap failed"; exit 1; }
+    say "Service loaded (launchd managed: starts at boot, restarts on crash)."
+  fi
+  wait_ready
+}
+
+cmd_stop() {
+  if ! is_loaded; then
+    say "Service is not running."
+    return 0
+  fi
+  launchctl bootout "${SERVICE}" && say "Stopped (auto-restart disabled; use 'supergpu start' to bring it back)."
+}
+
+cmd_restart() {
+  if ! is_loaded; then
+    cmd_start
+    return
+  fi
+  # SIGINT triggers graceful shutdown: the database lease is released and
+  # launchd immediately spawns a fresh instance.
+  launchctl kill SIGINT "${SERVICE}"
+  say "Graceful restart signal sent."
+  wait_ready
+}
+
+cmd_status() {
+  if is_loaded; then
+    pid="$(launchctl print "${SERVICE}" 2>/dev/null | awk '/pid = /{print $3; exit}')"
+    say "launchd: loaded (pid ${pid:-?})"
+  else
+    say "launchd: not loaded"
+  fi
+  body="$(health)"
+  if [ -z "${body}" ]; then
+    say "API: no response (right after a restart wait 1-2 min for lease takeover;"
+    say "     if the whole Mac is sluggish, check memory pressure first)"
+    return 1
+  fi
+  printf '%s' "${body}" | URL="${URL}" python3 -c '
+import json, os, sys, time
+d = json.load(sys.stdin)
+s = d["scheduler"]
+w = s["watchdog"]
+age = time.time() - s["last_tick"]
+print("API: healthy | tick %d (last %.0fs ago)" % (s["tick_count"], age))
+print("jobs: running %d / pending %d" % (s["active_jobs"], s["pending_jobs"]))
+print("watchdog: %s | observing %d / active %d" % (w["policy"]["action"], w["observing"], w["active"]))
+print("dashboard: %s" % os.environ["URL"])
+'
+}
+
+cmd_logs() {
+  say "== stdout (${STDOUT_LOG}) =="
+  tail -n 20 "${STDOUT_LOG}" 2>/dev/null
+  say ""
+  say "== stderr (${STDERR_LOG}) =="
+  tail -n 10 "${STDERR_LOG}" 2>/dev/null
+}
+
+cmd_open() {
+  open "${URL}"
+}
+
+case "${1:-}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ;;
+  open)    cmd_open ;;
+  *)
+    say "Usage: supergpu {start|stop|restart|status|logs|open}"
+    say "  start    load the launchd service (auto-start at boot)"
+    say "  stop     stop and disable auto-restart"
+    say "  restart  graceful restart (release lease, relaunch)"
+    say "  status   service / API / jobs / watchdog overview"
+    say "  logs     tail controller logs"
+    say "  open     open the dashboard in the browser"
+    exit 1
+    ;;
+esac
