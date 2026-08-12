@@ -762,7 +762,12 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { data: null, timer: null, token: localStorage.getItem("super_gpu_token") || "" };
+    const state = {
+      data: null,
+      timer: null,
+      token: localStorage.getItem("super_gpu_token") || "",
+      openProcs: new Set(),
+    };
     const samplePlan = {
       name: "my-experiment",
       max_parallel: 8,
@@ -942,12 +947,19 @@
             <span>${gpu.power_w == null ? "—" : `${Number(gpu.power_w).toFixed(0)}W`}</span>
             <span>${(gpu.processes || []).length} processes</span>
           </div>
-          ${renderProcesses(gpu.processes || [])}
+          ${renderProcesses(gpu.processes || [], `${node.node}:${gpu.uuid || gpu.index}`)}
           ${leases.length ? `<div class="leases">${leases.map((lease) => `<span class="lease" title="${esc(lease.job_id)}">${esc(lease.job_name)} · ${fmtMib(lease.memory_mib)}</span>`).join("")}</div>` : ""}
         </div>`;
     }
 
-    function renderProcesses(processes) {
+    function procToggled(el) {
+      const key = el.dataset.key;
+      if (!key) return;
+      if (el.open) state.openProcs.add(key);
+      else state.openProcs.delete(key);
+    }
+
+    function renderProcesses(processes, key) {
       if (!processes.length) return "";
       const rows = processes.map((proc) => {
         const command = proc.command || proc.process_name || "";
@@ -966,7 +978,7 @@
             <code>${esc(command.length > 160 ? `${command.slice(0, 160)}…` : command)}</code>
           </div>`;
       }).join("");
-      return `<details class="procs"><summary>进程详情</summary>${rows}</details>`;
+      return `<details class="procs" data-key="${esc(key)}" ${state.openProcs.has(key) ? "open" : ""} ontoggle="procToggled(this)"><summary>进程详情</summary>${rows}</details>`;
     }
 
     function renderJobs(jobs) {
