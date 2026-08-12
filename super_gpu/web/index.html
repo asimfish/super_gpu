@@ -430,6 +430,38 @@
       font-size: 9px;
     }
 
+    .procs { margin-top: 9px; }
+    .procs summary {
+      cursor: pointer;
+      color: #728095;
+      font-size: 9px;
+      user-select: none;
+    }
+    .procs summary:hover { color: var(--cyan); }
+    .proc {
+      margin-top: 6px;
+      padding: 6px 7px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .proc-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: #8b99ae;
+      font-size: 9px;
+      margin-bottom: 3px;
+    }
+    .proc code {
+      display: block;
+      color: #a9b7cc;
+      font-size: 9px;
+      line-height: 1.4;
+      word-break: break-all;
+      white-space: normal;
+    }
+
     .leases { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 11px; }
     .lease {
       max-width: 100%;
@@ -777,6 +809,17 @@
       return value >= 1024 ? `${(value / 1024).toFixed(value >= 10240 ? 0 : 1)} GiB` : `${value} MiB`;
     }
 
+    function fmtElapsed(seconds) {
+      if (seconds == null) return "—";
+      const total = Number(seconds);
+      const days = Math.floor(total / 86400);
+      const hours = Math.floor((total % 86400) / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      if (days) return `${days}d${hours}h`;
+      if (hours) return `${hours}h${minutes}m`;
+      return `${minutes}m`;
+    }
+
     function headers() {
       return state.token ? { "Authorization": `Bearer ${state.token}` } : {};
     }
@@ -899,8 +942,31 @@
             <span>${gpu.power_w == null ? "—" : `${Number(gpu.power_w).toFixed(0)}W`}</span>
             <span>${(gpu.processes || []).length} processes</span>
           </div>
+          ${renderProcesses(gpu.processes || [])}
           ${leases.length ? `<div class="leases">${leases.map((lease) => `<span class="lease" title="${esc(lease.job_id)}">${esc(lease.job_name)} · ${fmtMib(lease.memory_mib)}</span>`).join("")}</div>` : ""}
         </div>`;
+    }
+
+    function renderProcesses(processes) {
+      if (!processes.length) return "";
+      const rows = processes.map((proc) => {
+        const command = proc.command || proc.process_name || "";
+        const tooltip = [
+          `pid ${proc.pid}`,
+          proc.user ? `user ${proc.user}` : "",
+          proc.cwd ? `cwd ${proc.cwd}` : "",
+          command,
+        ].filter(Boolean).join("\n");
+        return `
+          <div class="proc" title="${esc(tooltip)}">
+            <div class="proc-line">
+              <span>${esc(proc.user || "?")} · pid ${proc.pid}</span>
+              <span>${fmtMib(proc.used_memory_mib)} · ${fmtElapsed(proc.elapsed_seconds)}</span>
+            </div>
+            <code>${esc(command.length > 160 ? `${command.slice(0, 160)}…` : command)}</code>
+          </div>`;
+      }).join("");
+      return `<details class="procs"><summary>进程详情</summary>${rows}</details>`;
     }
 
     function renderJobs(jobs) {

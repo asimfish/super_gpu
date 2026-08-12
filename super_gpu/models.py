@@ -338,6 +338,9 @@ class GpuProcess:
     process_name: str
     used_memory_mib: int
     user: str = ""
+    command: str = ""
+    elapsed_seconds: int | None = None
+    cwd: str = ""
 
 
 @dataclass

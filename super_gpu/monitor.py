@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import re
+import shlex
 import threading
 import time
 from collections import defaultdict, deque
@@ -15,6 +17,10 @@ from .transport import CommandTransport
 GPU_MARKER = "__SUPER_GPU_GPU__"
 PROCESS_MARKER = "__SUPER_GPU_PROCESS__"
 PROCESS_USER_MARKER = "__SUPER_GPU_PROCESS_USER__"
+PROCESS_DETAIL_MARKER = "__SUPER_GPU_PROCESS_DETAIL__"
+# Detail rows use the ASCII unit separator so full command lines containing
+# commas or spaces survive the round trip.
+DETAIL_SEPARATOR = "\x1f"
 QUERY_SCRIPT = f"""
 set +e
 echo {GPU_MARKER}
@@ -23,13 +29,44 @@ gpu_rc=$?
 echo {PROCESS_MARKER}
 proc_out=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null)
 printf '%s\n' "$proc_out"
-echo {PROCESS_USER_MARKER}
+echo {PROCESS_DETAIL_MARKER}
 printf '%s\n' "$proc_out" | awk -F, '{{gsub(/[[:space:]]/, "", $2); if ($2 ~ /^[0-9]+$/) print $2}}' | sort -u | while read -r pid; do
   user=$(ps -o user= -p "$pid" 2>/dev/null | awk '{{$1=$1; print}}')
-  printf '%s,%s\n' "$pid" "$user"
+  etimes=$(ps -o etimes= -p "$pid" 2>/dev/null | awk '{{$1=$1; print}}')
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+  args=$(ps -ww -o args= -p "$pid" 2>/dev/null)
+  printf '%s\037%s\037%s\037%s\037%s\n' "$pid" "$user" "$etimes" "$cwd" "$args"
 done
 exit "$gpu_rc"
 """.strip()
+
+_SENSITIVE_ARG = re.compile(
+    r"(api[-_]?key|access[-_]?key|secret|token|password|passwd|credential)", re.I
+)
+
+
+def redact_command(command: str) -> str:
+    """Mask values of credential-looking CLI arguments before storage."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    redacted: list[str] = []
+    hide_next = False
+    for token in tokens:
+        if hide_next:
+            redacted.append("[REDACTED]")
+            hide_next = False
+            continue
+        if _SENSITIVE_ARG.search(token):
+            if "=" in token:
+                redacted.append(f"{token.split('=', 1)[0]}=[REDACTED]")
+            else:
+                redacted.append(token)
+                hide_next = True
+            continue
+        redacted.append(token)
+    return " ".join(redacted)
 
 
 def _number(value: str, *, integer: bool = True) -> int | float | None:
@@ -50,6 +87,7 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
     gpu_rows: list[str] = []
     process_rows: list[str] = []
     process_user_rows: list[str] = []
+    process_detail_rows: list[str] = []
     for raw in stdout.splitlines():
         line = raw.strip()
         if line == GPU_MARKER:
@@ -61,6 +99,9 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
         if line == PROCESS_USER_MARKER:
             section = "process_user"
             continue
+        if line == PROCESS_DETAIL_MARKER:
+            section = "process_detail"
+            continue
         if not line:
             continue
         if section == "gpu":
@@ -69,6 +110,8 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
             process_rows.append(line)
         elif section == "process_user":
             process_user_rows.append(line)
+        elif section == "process_detail":
+            process_detail_rows.append(line)
 
     process_users: dict[int, str] = {}
     for row in process_user_rows:
@@ -78,6 +121,23 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
         pid = _number(parts[0])
         if pid is not None:
             process_users[int(pid)] = parts[1]
+
+    process_details: dict[int, dict[str, str | int | None]] = {}
+    for row in process_detail_rows:
+        parts = row.split(DETAIL_SEPARATOR, 4)
+        if len(parts) != 5:
+            continue
+        pid = _number(parts[0])
+        if pid is None:
+            continue
+        elapsed = _number(parts[2])
+        process_details[int(pid)] = {
+            "user": parts[1].strip(),
+            "elapsed_seconds": int(elapsed) if elapsed is not None else None,
+            "cwd": parts[3].strip(),
+            "command": redact_command(parts[4].strip()),
+        }
+
     processes: dict[str, list[GpuProcess]] = defaultdict(list)
     for row in process_rows:
         parts = [part.strip() for part in row.split(",", 3)]
@@ -87,12 +147,16 @@ def parse_nvidia_output(stdout: str) -> list[GpuSnapshot]:
         memory = _number(parts[3])
         if pid is None or memory is None:
             continue
+        detail = process_details.get(int(pid), {})
         processes[parts[0]].append(
             GpuProcess(
                 pid=int(pid),
                 process_name=parts[2],
                 used_memory_mib=int(memory),
-                user=process_users.get(int(pid), ""),
+                user=str(detail.get("user") or process_users.get(int(pid), "")),
+                command=str(detail.get("command") or ""),
+                elapsed_seconds=detail.get("elapsed_seconds"),  # type: ignore[arg-type]
+                cwd=str(detail.get("cwd") or ""),
             )
         )
 

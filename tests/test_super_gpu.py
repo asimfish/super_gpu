@@ -23,7 +23,7 @@ from super_gpu.models import (
     ResourceEstimate,
     RunnerHandle,
 )
-from super_gpu.monitor import ClusterMonitor, parse_nvidia_output
+from super_gpu.monitor import ClusterMonitor, parse_nvidia_output, redact_command
 from super_gpu.placement import PlacementEngine
 from super_gpu.runner import PersistentRunner, RunnerStatus
 from super_gpu.scheduler import Scheduler
@@ -186,21 +186,53 @@ def test_import_gpumgr_inventory_defaults_to_shared_and_writes_private_config(
 
 
 def test_parse_nvidia_output_with_processes():
-    raw = """
+    sep = "\x1f"
+    raw = f"""
 __SUPER_GPU_GPU__
 0, GPU-a, NVIDIA A100-SXM4-80GB, 71, 42000, 39000, 81000, 67, 298.50
 1, GPU-b, NVIDIA A100-SXM4-80GB, 0, 100, 80900, 81000, 35, [Not Supported]
+__SUPER_GPU_PROCESS__
+GPU-a, 1234, python3, 41000
+__SUPER_GPU_PROCESS_DETAIL__
+1234{sep}researcher{sep}7325{sep}/home/researcher/proj{sep}python3 train.py --lr 1e-4, --api-key hunter2
+"""
+    gpus = parse_nvidia_output(raw)
+    assert len(gpus) == 2
+    assert gpus[0].utilization == 71
+    process = gpus[0].processes[0]
+    assert process.pid == 1234
+    assert process.user == "researcher"
+    assert process.elapsed_seconds == 7325
+    assert process.cwd == "/home/researcher/proj"
+    assert "--lr 1e-4," in process.command
+    assert "hunter2" not in process.command
+    assert "[REDACTED]" in process.command
+    assert gpus[1].power_w is None
+
+
+def test_parse_nvidia_output_accepts_legacy_user_rows():
+    raw = """
+__SUPER_GPU_GPU__
+0, GPU-a, NVIDIA A100-SXM4-80GB, 71, 42000, 39000, 81000, 67, 298.50
 __SUPER_GPU_PROCESS__
 GPU-a, 1234, python3, 41000
 __SUPER_GPU_PROCESS_USER__
 1234,researcher
 """
     gpus = parse_nvidia_output(raw)
-    assert len(gpus) == 2
-    assert gpus[0].utilization == 71
-    assert gpus[0].processes[0].pid == 1234
-    assert gpus[0].processes[0].user == "researcher"
-    assert gpus[1].power_w is None
+    process = gpus[0].processes[0]
+    assert process.user == "researcher"
+    assert process.command == ""
+    assert process.elapsed_seconds is None
+
+
+def test_redact_command_masks_credentials():
+    assert redact_command("python serve.py --token abc123 --port 8000") == (
+        "python serve.py --token [REDACTED] --port 8000"
+    )
+    assert redact_command("run --api-key=sk-secret --safe") == (
+        "run --api-key=[REDACTED] --safe"
+    )
 
 
 def test_watchdog_reports_unmanaged_idle_gpu_without_cancellation():
