@@ -47,14 +47,28 @@ credentials and connection topology remain in the operator's `~/.ssh/config`.
 - `IdleGpuGuardian`: identifies sustained low-utilization GPU occupancy and
   proposes managed-job cancellation according to configuration.
 - `StateStore`: persists plans, jobs, leases, telemetry, and audit events.
+- `SourceSnapshotStore`: builds deterministic source archives and addresses
+  them by SHA-256 digest.
 - REST/MCP adapters: expose typed scheduling and inspection operations to
   local agents and operators.
+
+## Reliable Submission Boundary
+
+Submission has three durable identities:
+
+1. `source_snapshot.digest` identifies the exact submitted source bytes.
+2. `request_id` plus `intent_digest` identifies one retry-safe API intent.
+3. `launch_token` plus process start ticks identifies one remote process.
+
+The snapshot is created before the database transaction; an interrupted
+submission may leave an unreferenced content object, but cannot leave a plan
+without jobs or an idempotency receipt without its plan. Remote extraction is
+allowed only after the archive digest is verified.
 
 ## Failure Model
 
 SSH and telemetry failures do not release live leases. Watchdog observations
-must be consecutive and time-bounded; controller restart clears non-durable
-observation timers, which fails safe by extending the grace period. Automatic
+must be consecutive and time-bounded and are persisted in SQLite. Automatic
 cancellation uses the existing durable job handle and runner cancellation path,
-never a telemetry PID supplied by a client.
-
+never a telemetry PID supplied by a client. If process identity cannot be
+proven, cancellation is refused and the lease remains active.

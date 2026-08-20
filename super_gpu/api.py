@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .models import ExperimentPlan
 from .scheduler import Scheduler
+from .store import IdempotencyConflict
 
 
 WEB_ROOT = Path(__file__).with_name("web")
@@ -211,9 +212,13 @@ class SuperGPUHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/plans":
                 raw_plan = body.get("plan", body)
+                if body.get("request_id"):
+                    raw_plan = dict(raw_plan)
+                    raw_plan["request_id"] = body["request_id"]
                 plan = ExperimentPlan.from_dict(raw_plan)
                 submitted = self.server.scheduler.submit(plan)
-                self._json(201, {"ok": True, "plan": submitted})
+                status = 200 if submitted.get("submission", {}).get("replayed") else 201
+                self._json(status, {"ok": True, "plan": submitted})
                 return
             if path == "/api/scan":
                 snapshots = self.server.scheduler.monitor.collect_all()
@@ -228,6 +233,9 @@ class SuperGPUHandler(BaseHTTPRequestHandler):
                 job = self.server.scheduler.store.request_cancel(job_id)
                 self._json(200 if job else 404, {"ok": bool(job), "job": job})
                 return
+        except IdempotencyConflict as exc:
+            self._json(409, {"ok": False, "error": str(exc), "code": "idempotency_conflict"})
+            return
         except (ValueError, KeyError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
             return

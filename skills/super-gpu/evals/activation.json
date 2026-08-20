@@ -1,0 +1,32 @@
+{
+  "skill": "super-gpu",
+  "cases": [
+    {
+      "name": "explicit_positive",
+      "prompt": "Use the super-gpu repository to schedule this plan on my dedicated and shared GPU servers.",
+      "should_activate": true
+    },
+    {
+      "name": "natural_positive",
+      "prompt": "Keep my main GPUs full, avoid busy shared GPUs, and monitor these experiments until they finish.",
+      "should_activate": true
+    },
+    {
+      "name": "adjacent_negative",
+      "prompt": "Optimize the CUDA kernel in this model implementation.",
+      "should_activate": false
+    },
+    {
+      "name": "explicit_exclusion",
+      "prompt": "Explain nvidia-smi output only; do not schedule or run anything.",
+      "should_activate": false
+    }
+  ],
+  "rubric": {
+    "security": "Uses only authorized servers, protects shared nodes, and gates cancellation.",
+    "correctness": "Uses immutable snapshot mode and one stable request ID per logical submission.",
+    "discoverability": "Activates for super_gpu and multi-server experiment scheduling requests.",
+    "effectiveness": "Validates, submits, backfills, supervises, and reports a terminal outcome.",
+    "efficiency": "Reuses a healthy controller and avoids manual GPU selection."
+  }
+}

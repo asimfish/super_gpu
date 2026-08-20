@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
 
 from .models import NodeConfig
@@ -190,3 +192,95 @@ class CommandTransport:
             )
         except OSError as exc:
             return CommandResult(127, "", str(exc), time.monotonic() - started)
+
+    def upload_file(
+        self,
+        node: NodeConfig,
+        source: str | os.PathLike[str],
+        destination: str,
+        *,
+        expected_sha256: str,
+        timeout: float = 120.0,
+    ) -> CommandResult:
+        """Atomically upload one verified file below the remote home directory."""
+        import hashlib
+        import time
+
+        if (
+            destination.startswith("/")
+            or ".." in Path(destination).parts
+            or len(expected_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+        ):
+            raise ValueError("upload destination or digest is unsafe")
+        source_path = Path(source).expanduser().resolve()
+        started = time.monotonic()
+        if self._is_local(node):
+            target = (Path.home() / destination).resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.parent.chmod(0o700)
+            temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+            shutil.copyfile(source_path, temporary)
+            digest = hashlib.sha256()
+            with temporary.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            actual = digest.hexdigest()
+            if actual != expected_sha256:
+                temporary.unlink(missing_ok=True)
+                return CommandResult(1, "", "uploaded file digest mismatch", time.monotonic() - started)
+            temporary.replace(target)
+            return CommandResult(0, "OK\n", "", time.monotonic() - started)
+
+        remote_script = r'''set -eu
+umask 077
+destination="$HOME/$SUPER_GPU_UPLOAD_DESTINATION"
+mkdir -p "$(dirname "$destination")"
+if [ -f "$destination" ] && [ "$(sha256sum "$destination" | awk '{print $1}')" = "$SUPER_GPU_UPLOAD_SHA256" ]; then
+  cat >/dev/null
+  echo OK
+  exit 0
+fi
+temporary="$destination.tmp.$$"
+trap 'rm -f "$temporary"' EXIT
+cat >"$temporary"
+actual=$(sha256sum "$temporary" | awk '{print $1}')
+[ "$actual" = "$SUPER_GPU_UPLOAD_SHA256" ]
+chmod 400 "$temporary"
+mv "$temporary" "$destination"
+trap - EXIT
+echo OK
+'''
+        assignments = " ".join(
+            (
+                f"SUPER_GPU_UPLOAD_DESTINATION={shlex.quote(destination)}",
+                f"SUPER_GPU_UPLOAD_SHA256={shlex.quote(expected_sha256)}",
+            )
+        )
+        argv = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={max(1, int(self.connect_timeout))}",
+            node.ssh,
+            f"env {assignments} bash -c {shlex.quote(remote_script)}",
+        ]
+        try:
+            with source_path.open("rb") as stream:
+                completed = subprocess.run(
+                    argv,
+                    stdin=stream,
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            return CommandResult(
+                completed.returncode,
+                completed.stdout.decode("utf-8", errors="replace"),
+                completed.stderr.decode("utf-8", errors="replace"),
+                time.monotonic() - started,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            code = 124 if isinstance(exc, subprocess.TimeoutExpired) else 127
+            return CommandResult(code, "", str(exc), time.monotonic() - started)

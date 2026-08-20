@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS plans (
   finished_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS submission_requests (
+  request_id TEXT PRIMARY KEY,
+  intent_digest TEXT NOT NULL,
+  plan_id TEXT NOT NULL UNIQUE REFERENCES plans(id) ON DELETE CASCADE,
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
@@ -141,6 +148,65 @@ def _loads(value: str | None, fallback: Any) -> Any:
         return fallback
 
 
+class IdempotencyConflict(ValueError):
+    """A request ID was already bound to a different submission intent."""
+
+
+def _plan_payload(plan: ExperimentPlan, plan_id: str) -> dict[str, Any]:
+    return {
+        "id": plan_id,
+        "name": plan.name,
+        "max_parallel": plan.max_parallel,
+        "defaults": plan.defaults,
+        "request_id": plan.request_id,
+        "source": plan.source,
+        "source_snapshot": plan.source_snapshot,
+        "jobs": [
+            {
+                "id": job.id,
+                "name": job.name,
+                "command": job.command,
+                "priority": job.priority,
+                "nodes": job.nodes,
+                "required_labels": job.required_labels,
+                "params": job.params,
+                "env": job.env,
+                "resources": {
+                    "gpus": job.resources.gpus,
+                    "memory_mib": job.resources.memory_mib,
+                    "gpu_utilization": job.resources.gpu_utilization,
+                    "duration_seconds": job.resources.duration_seconds,
+                    "allow_colocation": job.resources.allow_colocation,
+                },
+                "timeout": job.timeout,
+                "max_retries": job.max_retries,
+                "retry_delay": job.retry_delay,
+                "dependencies": job.dependencies,
+            }
+            for job in plan.jobs
+        ],
+    }
+
+
+def _intent_digest(plan: ExperimentPlan) -> str:
+    import hashlib
+
+    payload = _plan_payload(plan, plan.id)
+    payload.pop("request_id", None)
+    source = dict(payload.get("source") or {})
+    if source.get("mode") == "snapshot":
+        source.pop("path", None)
+        source.pop("exclude", None)
+    payload["source"] = source
+    snapshot = dict(payload.get("source_snapshot") or {})
+    payload["source_snapshot"] = {
+        key: snapshot[key]
+        for key in ("digest", "format")
+        if key in snapshot
+    }
+    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+
+
 class StateStore:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -191,99 +257,106 @@ class StateStore:
     def submit_plan(self, plan: ExperimentPlan) -> dict[str, Any]:
         plan_id = plan.id or new_id("plan")
         created = now_ts()
-        plan_payload = {
-            "id": plan_id,
-            "name": plan.name,
-            "max_parallel": plan.max_parallel,
-            "defaults": plan.defaults,
-            "jobs": [
-                {
-                    "id": job.id,
-                    "name": job.name,
-                    "command": job.command,
-                    "priority": job.priority,
-                    "nodes": job.nodes,
-                    "required_labels": job.required_labels,
-                    "params": job.params,
-                    "env": job.env,
-                    "resources": {
-                        "gpus": job.resources.gpus,
-                        "memory_mib": job.resources.memory_mib,
-                        "gpu_utilization": job.resources.gpu_utilization,
-                        "duration_seconds": job.resources.duration_seconds,
-                        "allow_colocation": job.resources.allow_colocation,
-                    },
-                    "timeout": job.timeout,
-                    "max_retries": job.max_retries,
-                    "retry_delay": job.retry_delay,
-                    "dependencies": job.dependencies,
-                }
-                for job in plan.jobs
-            ],
-        }
+        plan_payload = _plan_payload(plan, plan_id)
+        intent_digest = _intent_digest(plan)
+        replayed = False
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(
-                    """
-                    INSERT INTO plans
-                      (id, name, status, max_parallel, total_jobs, plan_json, created_at, updated_at)
-                    VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        plan_id,
-                        plan.name,
-                        plan.max_parallel,
-                        len(plan.jobs),
-                        _json(plan_payload),
-                        created,
-                        created,
-                    ),
-                )
-                for job in plan.jobs:
-                    job_id = job.id or new_id("job")
+                if plan.request_id:
+                    receipt = conn.execute(
+                        "SELECT intent_digest, plan_id FROM submission_requests WHERE request_id=?",
+                        (plan.request_id,),
+                    ).fetchone()
+                    if receipt:
+                        if receipt["intent_digest"] != intent_digest:
+                            raise IdempotencyConflict(
+                                f"request_id {plan.request_id!r} is already bound to a different plan intent"
+                            )
+                        plan_id = str(receipt["plan_id"])
+                        replayed = True
+                if not replayed:
                     conn.execute(
                         """
-                        INSERT INTO jobs (
-                          id, plan_id, name, command, status, priority,
-                          nodes_json, labels_json, params_json, env_json,
-                          resources_json, dependencies_json, timeout,
-                          max_retries, retry_delay, fingerprint, submitted_at
-                        ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO plans
+                          (id, name, status, max_parallel, total_jobs, plan_json, created_at, updated_at)
+                        VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
                         """,
                         (
-                            job_id,
                             plan_id,
-                            job.name,
-                            job.command,
-                            job.priority,
-                            _json(job.nodes),
-                            _json(job.required_labels),
-                            _json(job.params),
-                            _json(job.env),
-                            _json(
-                                {
-                                    "gpus": job.resources.gpus,
-                                    "memory_mib": job.resources.memory_mib,
-                                    "gpu_utilization": job.resources.gpu_utilization,
-                                    "duration_seconds": job.resources.duration_seconds,
-                                    "allow_colocation": job.resources.allow_colocation,
-                                }
-                            ),
-                            _json(job.dependencies),
-                            job.timeout,
-                            job.max_retries,
-                            job.retry_delay,
-                            job.fingerprint(),
+                            plan.name,
+                            plan.max_parallel,
+                            len(plan.jobs),
+                            _json(plan_payload),
+                            created,
                             created,
                         ),
                     )
+                    for job in plan.jobs:
+                        job_id = job.id or new_id("job")
+                        conn.execute(
+                            """
+                            INSERT INTO jobs (
+                              id, plan_id, name, command, status, priority,
+                              nodes_json, labels_json, params_json, env_json,
+                              resources_json, dependencies_json, timeout,
+                              max_retries, retry_delay, fingerprint, submitted_at
+                            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                job_id,
+                                plan_id,
+                                job.name,
+                                job.command,
+                                job.priority,
+                                _json(job.nodes),
+                                _json(job.required_labels),
+                                _json(job.params),
+                                _json(job.env),
+                                _json(
+                                    {
+                                        "gpus": job.resources.gpus,
+                                        "memory_mib": job.resources.memory_mib,
+                                        "gpu_utilization": job.resources.gpu_utilization,
+                                        "duration_seconds": job.resources.duration_seconds,
+                                        "allow_colocation": job.resources.allow_colocation,
+                                    }
+                                ),
+                                _json(job.dependencies),
+                                job.timeout,
+                                job.max_retries,
+                                job.retry_delay,
+                                job.fingerprint(),
+                                created,
+                            ),
+                        )
+                    if plan.request_id:
+                        conn.execute(
+                            """
+                            INSERT INTO submission_requests
+                              (request_id, intent_digest, plan_id, created_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (plan.request_id, intent_digest, plan_id, created),
+                        )
                 conn.execute("COMMIT")
             except Exception:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise
-        self.add_event("plan_submitted", f"plan {plan.name} submitted", {"plan_id": plan_id})
-        return self.get_plan(plan_id, include_jobs=True)
+        if not replayed:
+            self.add_event(
+                "plan_submitted",
+                f"plan {plan.name} submitted",
+                {"plan_id": plan_id, "request_id": plan.request_id, "intent_digest": intent_digest},
+            )
+        result = self.get_plan(plan_id, include_jobs=True)
+        result["submission"] = {
+            "request_id": plan.request_id,
+            "intent_digest": intent_digest,
+            "replayed": replayed,
+        }
+        return result
 
     def get_plan(self, plan_id: str, *, include_jobs: bool = False) -> dict[str, Any]:
         with self.connect() as conn:

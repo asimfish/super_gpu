@@ -7,7 +7,26 @@
   "additionalProperties": false,
   "properties": {
     "id": {"type": "string"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
     "name": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"enum": ["workspace", "snapshot"]},
+        "path": {"type": "string", "minLength": 1},
+        "exclude": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "source_snapshot": {
+      "type": "object",
+      "readOnly": true,
+      "additionalProperties": true,
+      "properties": {
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "format": {"const": "tar.gz.v1"}
+      }
+    },
     "max_parallel": {"type": "integer", "minimum": 1},
     "defaults": {"$ref": "#/$defs/jobDefaults"},
     "jobs": {

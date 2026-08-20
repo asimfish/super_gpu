@@ -9,6 +9,9 @@
 - **持续补位**：调度器每隔数秒重采集集群状态。任何 GPU 稳定释放后，会立即从 pending 队列挑选合适实验。
 - **资源估算**：首轮使用计划声明或保守启发值；完成后记录实际峰值显存与运行时长，后续相同任务自动采用历史估算。OOM 会自动提高下一次显存预算。
 - **可靠运行**：远端命令通过持久 runner 执行。控制器重启后可以依靠远端 PID、日志和退出码文件恢复监管。
+- **不可变实验快照**：提交时生成确定性源码归档，以 SHA-256 内容寻址；远端校验后再为每个 job 解包执行。
+- **幂等提交**：稳定 `request_id` 与实验意图摘要同事务落库；超时重试返回原计划，冲突内容返回 HTTP 409。
+- **强任务身份**：runner 同时校验 launch token、PID 与 Linux 进程启动时钟，拒绝向 PID 复用后的无关进程发信号。
 - **Agent 接入**：同时提供 CLI、REST 和 MCP；仓库内有 `AGENTS.md` 与 JSON Schema。
 - **实时前端**：一个无外部 CDN 依赖的 Dashboard，展示全部服务器、GPU、租约、实验队列与调度事件。
 
@@ -91,6 +94,7 @@ cp examples/nodes.example.json config.json
 
 ```bash
 .venv/bin/super-gpu submit examples/experiment.example.json \
+  --request-id learning-rate-sweep-001 \
   --url http://127.0.0.1:8765
 
 .venv/bin/super-gpu jobs --url http://127.0.0.1:8765
@@ -144,7 +148,13 @@ cp examples/nodes.example.json config.json
 
 ```json
 {
+  "request_id": "ablation-001",
   "name": "ablation",
+  "source": {
+    "mode": "snapshot",
+    "path": "/controller/path/to/project",
+    "exclude": ["outputs/**", "data/**"]
+  },
   "max_parallel": 8,
   "defaults": {
     "max_retries": 1,
@@ -178,6 +188,17 @@ PYTHONUNBUFFERED=1
 ```
 
 `dependencies` 使用同一 plan 内的 job name。依赖完成后，下游任务才会进入可调度状态。
+
+### 快照与幂等语义
+
+- `source.mode: snapshot` 会在 controller 上读取 `source.path`，生成不含
+  mtime、uid/gid 等不稳定元数据的确定性 `tar.gz`。相同文件内容得到相同 digest。
+- `.git`、虚拟环境、`.env`、私钥等默认排除；额外排除项会记录在快照元数据中。
+- immutable 指归档对象和 digest 不可变。每个 job 获得独立、可写的执行副本，避免修改归档；跨 job 产物应写入显式共享路径或对象存储。
+- 相同 `request_id` + 相同计划/快照 digest 是安全重试，返回原 plan 且
+  `submission.replayed=true`；相同 ID 配不同内容返回 `idempotency_conflict`。
+- 有意重复同一个实验时必须使用新的 request ID。
+- snapshot 路径位于 controller 主机；通过 REST/MCP 远程提交时，该路径也必须对 controller 可见。
 
 ## 资源估算
 
@@ -235,7 +256,8 @@ export SUPER_GPU_WATCHDOG_ACTION=cancel_managed
 ```
 
 自动取消仍需同时满足最短运行时间、连续低利用率宽限期、显存阈值、可见
-GPU 进程和独占租约。controller 重启会重置宽限期，避免因旧状态误杀任务。
+GPU 进程和独占租约。watchdog 观察状态持久化在 SQLite 中；过长采样间隔会
+按陈旧状态处理，不会把 controller 离线时间误计为持续空闲。
 
 HTTP MCP：
 
@@ -256,7 +278,7 @@ SUPER_GPU_URL=http://127.0.0.1:8765 \
 | GET | `/api/snapshot` | 最新 GPU 快照 |
 | GET | `/api/plans` | 计划列表 |
 | GET | `/api/plans/<id>` | 计划和所有 jobs |
-| POST | `/api/plans` | 提交计划 JSON |
+| POST | `/api/plans` | 提交计划 JSON；支持顶层 `request_id`，冲突返回 409 |
 | GET | `/api/jobs` | 查询 jobs |
 | POST | `/api/jobs/<id>/cancel` | 取消任务 |
 | POST | `/api/scan` | 立即刷新 GPU 状态 |
@@ -278,6 +300,7 @@ super-gpu --config config.json serve --host 0.0.0.0
 - GPU Util 无法可靠按单进程拆分，因此共享节点采用总 Util 保守准入。
 - 显存历史峰值在并置任务场景是保守估计，宁可少放任务也避免 OOM。
 - 单个 SQLite 数据库只允许一个活动调度控制器；这正是防止双重调度的安全约束。
+- 新任务使用 token + `/proc` start ticks 验证进程身份；升级前仍在运行的旧 handle 以 PID-only 兼容模式监管到结束。
 
 ## 测试
 

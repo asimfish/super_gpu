@@ -37,7 +37,12 @@ admission, and supervise the plan through a terminal state.
    fabricate credentials, copy private keys, or commit private host data.
 6. Convert the experiment description into a plan that satisfies the JSON
    Schema. Preserve commands and scientific parameters exactly.
-7. Prefer explicit `resources.memory_mib` for a never-before-run
+7. Add `source.mode: snapshot` with an absolute controller-visible project
+   path unless the user explicitly requires the mutable node workspace. Review
+   default and custom exclusions so secrets and large datasets are not packed.
+8. Choose a stable, safe `request_id` for this logical submission. Persist it
+   in the private plan or run record and reuse it only for transport retries.
+9. Prefer explicit `resources.memory_mib` for a never-before-run
    memory-sensitive workload. Use `"auto"` when a conservative first-run
    estimate is acceptable; explain that later runs improve from measured
    history.
@@ -71,7 +76,9 @@ or detached multi-hour execution:
 .venv/bin/super-gpu submit /private/path/plan.json --url http://127.0.0.1:8765
 ```
 
-Use
+Include `--request-id ID` when using the CLI. MCP `experiment_submit` requires
+the same stable ID. If the API returns `idempotency_conflict`, stop and compare
+the plan and snapshot digest; do not silently choose a new ID. Use
 `.venv/bin/super-gpu --config /private/path/config.json run /private/path/plan.json`
 only for a foreground one-shot run.
 
@@ -84,20 +91,22 @@ thresholds, and backfills newly stable capacity on every cycle.
 After submission:
 
 1. Record the returned plan ID.
-2. Poll MCP `experiment_status`, `experiment_jobs`, and `scheduler_events`, or
+2. Record `submission.intent_digest`, `submission.replayed`, and the source
+   snapshot digest. A replay must refer to the same returned plan ID.
+3. Poll MCP `experiment_status`, `experiment_jobs`, and `scheduler_events`, or
    the equivalent CLI endpoints.
-3. Keep the controller alive and continue monitoring until every job is
+4. Keep the controller alive and continue monitoring until every job is
    `completed`, `failed`, or `cancelled`, unless the user explicitly asks for
    detached handoff.
-4. On pending jobs, inspect placement events before changing anything. Capacity
+5. On pending jobs, inspect placement events before changing anything. Capacity
    becoming available requires no manual action; the next stable scan schedules
    eligible work.
-5. On failure, report the node, GPU indices, attempt count, exit code, and
+6. On failure, report the node, GPU indices, attempt count, exit code, and
    stderr tail. Let configured retries run; never alter scientific parameters
    merely to make a job pass.
-6. Cancel only when explicitly requested or when the user explicitly
+7. Cancel only when explicitly requested or when the user explicitly
    authorized cleanup of this plan.
-7. Query `anomaly_report` during supervision. Unmanaged findings are
+8. Query `anomaly_report` during supervision. Unmanaged findings are
    report-only. Enable `cancel_managed` only when the operator explicitly
    authorizes automatic cleanup of scheduler-owned jobs.
 

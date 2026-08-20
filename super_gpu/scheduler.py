@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 
 from .estimator import ResourceEstimator
@@ -21,6 +22,7 @@ from .models import (
 from .monitor import ClusterMonitor
 from .placement import PlacementEngine
 from .runner import PersistentRunner
+from .source_snapshot import SourceSnapshotStore
 from .store import StateStore
 
 
@@ -40,6 +42,9 @@ class Scheduler:
         self.store = store or StateStore(config.database)
         self.monitor = monitor or ClusterMonitor(config)
         self.runner = runner or PersistentRunner(self.monitor.transport)
+        self.source_snapshots = SourceSnapshotStore(
+            Path(self.store.path).parent / "source-snapshots"
+        )
         self.estimator = estimator or ResourceEstimator(config, self.store)
         self.placement = placement or PlacementEngine(config, self.monitor)
         self.guardian = guardian or IdleGpuGuardian()
@@ -56,6 +61,14 @@ class Scheduler:
         self._node_reachability: dict[str, bool] = {}
 
     def submit(self, plan: ExperimentPlan) -> dict[str, Any]:
+        if str(plan.source.get("mode") or "workspace") == "snapshot":
+            snapshot = self.source_snapshots.create(
+                str(plan.source["path"]),
+                list(plan.source.get("exclude") or []),
+            )
+            plan.source_snapshot = snapshot.as_dict()
+        else:
+            plan.source_snapshot = {}
         return self.store.submit_plan(plan)
 
     def start(self) -> None:
@@ -222,7 +235,15 @@ class Scheduler:
                 continue
 
             if row["cancel_requested"] or row["status"] == "cancelling":
-                self.runner.cancel(node, handle)
+                cancelled = self.runner.cancel(node, handle)
+                if cancelled is False:
+                    self.store.heartbeat_leases(row["id"], self.config.lease_ttl)
+                    self.store.add_event(
+                        "job_cancel_refused",
+                        f"job {row['name']} cancellation refused: process identity was not proven",
+                        {"job_id": row["id"], "node": row["node"]},
+                    )
+                    continue
                 self.store.finish_job(
                     row["id"],
                     status="cancelled",
@@ -239,7 +260,15 @@ class Scheduler:
                 continue
 
             if time.time() - handle.started_at > float(row["timeout"]):
-                self.runner.cancel(node, handle)
+                cancelled = self.runner.cancel(node, handle)
+                if cancelled is False:
+                    self.store.heartbeat_leases(row["id"], self.config.lease_ttl)
+                    self.store.add_event(
+                        "job_timeout_cancel_refused",
+                        f"timed-out job {row['name']} remains leased because process identity was not proven",
+                        {"job_id": row["id"], "node": row["node"]},
+                    )
+                    continue
                 self._finish_unsuccessful(
                     row,
                     job,
@@ -261,6 +290,14 @@ class Scheduler:
             if status.state in {"running", "unknown"}:
                 # A transient SSH failure must not release a live GPU lease.
                 self.store.heartbeat_leases(row["id"], self.config.lease_ttl)
+                continue
+            if status.state == "lost" and "identity" in status.error:
+                self.store.heartbeat_leases(row["id"], self.config.lease_ttl)
+                self.store.add_event(
+                    "job_identity_unverified",
+                    f"job {row['name']} remains leased because runner identity is unverified",
+                    {"job_id": row["id"], "node": row["node"], "error": status.error},
+                )
                 continue
 
             duration = max(0.0, time.time() - handle.started_at)
@@ -370,11 +407,22 @@ class Scheduler:
             try:
                 node = self.config.node(placement.node)
                 env = self._job_env(row, placement.gpu_indices)
+                snapshot = dict((plan.get("plan") or {}).get("source_snapshot") or {})
+                snapshot_digest = str(snapshot.get("digest") or "")
+                snapshot_path = ""
+                if snapshot_digest:
+                    snapshot_path = str(self.source_snapshots.verify(snapshot_digest))
+                launch_options: dict[str, Any] = {"env": env}
+                if snapshot_digest:
+                    launch_options.update(
+                        snapshot_digest=snapshot_digest,
+                        snapshot_path=snapshot_path,
+                    )
                 handle = self.runner.launch(
                     node,
                     job,
                     placement.gpu_indices,
-                    env=env,
+                    **launch_options,
                 )
                 self.store.mark_running(row["id"], handle.as_dict())
                 self.store.add_event(

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -27,7 +29,8 @@ from super_gpu.monitor import ClusterMonitor, parse_nvidia_output, redact_comman
 from super_gpu.placement import PlacementEngine
 from super_gpu.runner import PersistentRunner, RunnerStatus
 from super_gpu.scheduler import Scheduler
-from super_gpu.store import StateStore
+from super_gpu.source_snapshot import SnapshotError, SourceSnapshotStore
+from super_gpu.store import IdempotencyConflict, StateStore
 
 
 def _config(tmp_path, *, nodes=None, default_memory=4096, max_parallel=8):
@@ -651,6 +654,54 @@ def test_store_dependency_gating(tmp_path):
     assert [job["name"] for job in store.runnable_jobs()] == ["b"]
 
 
+def test_submission_request_is_transactionally_idempotent(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    first_plan = ExperimentPlan.from_dict(
+        {
+            "request_id": "agent-retry-001",
+            "name": "retry-safe",
+            "jobs": [{"name": "train", "command": "echo first"}],
+        }
+    )
+    first = store.submit_plan(first_plan)
+    replay = store.submit_plan(first_plan)
+    assert replay["id"] == first["id"]
+    assert replay["submission"]["replayed"] is True
+    assert len(store.list_plans()) == 1
+    assert len(store.list_jobs()) == 1
+
+    conflicting = ExperimentPlan.from_dict(
+        {
+            "request_id": "agent-retry-001",
+            "name": "retry-safe",
+            "jobs": [{"name": "train", "command": "echo changed"}],
+        }
+    )
+    with pytest.raises(IdempotencyConflict, match="different plan intent"):
+        store.submit_plan(conflicting)
+    assert len(store.list_plans()) == 1
+
+
+def test_source_snapshot_is_deterministic_and_rejects_escaping_symlink(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "train.py").write_text("print('v1')\n", encoding="utf-8")
+    (source / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+    snapshots = SourceSnapshotStore(tmp_path / "objects")
+    first = snapshots.create(source)
+    (source / "train.py").touch()
+    second = snapshots.create(source)
+    assert first.digest == second.digest
+    assert first.file_count == 1
+    assert snapshots.verify(first.digest).is_file()
+    (source / "train.py").write_text("print('v2')\n", encoding="utf-8")
+    assert snapshots.create(source).digest != first.digest
+
+    (source / "outside").symlink_to(tmp_path / "outside")
+    with pytest.raises(SnapshotError, match="escapes source root"):
+        snapshots.create(source)
+
+
 def test_failed_dependency_propagates_to_downstream_jobs(tmp_path):
     config = _config(tmp_path)
     store = StateStore(config.database)
@@ -712,6 +763,17 @@ class FakeRunner:
             self.handles[pid] = "finished"
 
 
+class UnverifiedIdentityRunner(FakeRunner):
+    def launch(self, node, job, gpu_indices, env=None):
+        handle = super().launch(node, job, gpu_indices, env=env)
+        handle.launch_token = "expected-token"
+        handle.process_start_ticks = 123
+        return handle
+
+    def poll(self, node, handle):
+        return RunnerStatus("lost", 255, "", "", "process identity mismatch")
+
+
 def test_scheduler_backfills_newly_available_gpu(tmp_path):
     config = _config(tmp_path, default_memory=4096, max_parallel=2)
     store = StateStore(config.database)
@@ -745,6 +807,29 @@ def test_scheduler_backfills_newly_available_gpu(tmp_path):
     store.release_controller(scheduler.owner)
 
 
+def test_scheduler_keeps_lease_when_process_identity_is_unverified(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    scheduler = Scheduler(
+        config,
+        store=store,
+        monitor=FakeMonitor([_snapshot()]),
+        runner=UnverifiedIdentityRunner(),
+    )
+    submitted = scheduler.submit(
+        ExperimentPlan.from_dict(
+            {"name": "identity", "jobs": [{"name": "train", "command": "sleep 10"}]}
+        )
+    )
+    scheduler.run_once()
+    scheduler.run_once()
+    job = store.list_jobs(plan_id=submitted["id"])[0]
+    assert job["status"] == "running"
+    assert store.leases(active_only=True)[0]["job_id"] == job["id"]
+    assert any(event["kind"] == "job_identity_unverified" for event in store.list_events())
+    store.release_controller(scheduler.owner)
+
+
 def test_local_persistent_runner_writes_logs(tmp_path):
     node = NodeConfig.from_dict(
         {
@@ -774,6 +859,89 @@ def test_local_persistent_runner_writes_logs(tmp_path):
     assert status is not None
     assert status.exit_code == 0
     assert "hello-super" in status.stdout_tail
+
+
+def test_runner_executes_captured_snapshot_and_refuses_wrong_identity(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value.txt").write_text("captured\n", encoding="utf-8")
+    snapshots = SourceSnapshotStore(tmp_path / "objects")
+    snapshot = snapshots.create(source)
+    (source / "value.txt").write_text("mutated\n", encoding="utf-8")
+    node = NodeConfig.from_dict(
+        {
+            "name": "local",
+            "ssh": "local",
+            "role": "dedicated",
+            "workspace": str(source),
+        }
+    )
+    job = JobSpec.from_dict(
+        {
+            "id": f"snapshot-{time.time_ns()}",
+            "name": "snapshot-test",
+            "command": "cat value.txt; sleep 2",
+        }
+    )
+    job.id = job.id
+    runner = PersistentRunner()
+    handle = runner.launch(
+        node,
+        job,
+        [0],
+        snapshot_digest=snapshot.digest,
+        snapshot_path=str(snapshots.verify(snapshot.digest)),
+    )
+    wrong = RunnerHandle.from_dict({**handle.as_dict(), "launch_token": "wrong-token"})
+    assert runner.poll(node, wrong).state == "lost"
+    assert runner.cancel(node, wrong) is False
+    assert runner.cancel(node, handle) is True
+
+    deadline = time.time() + 5
+    status = runner.poll(node, handle)
+    while not status.finished and time.time() < deadline:
+        time.sleep(0.05)
+        status = runner.poll(node, handle)
+    assert "captured" in status.stdout_tail
+    assert "mutated" not in status.stdout_tail
+
+    execution_file = Path(handle.run_dir) / "workspace" / "value.txt"
+    execution_file.write_text("dirty-attempt\n", encoding="utf-8")
+    retry = runner.launch(
+        node,
+        job,
+        [0],
+        snapshot_digest=snapshot.digest,
+        snapshot_path=str(snapshots.verify(snapshot.digest)),
+    )
+    assert (Path(retry.run_dir) / "workspace" / "value.txt").read_text(encoding="utf-8") == "captured\n"
+    assert runner.cancel(node, retry) is True
+
+
+def test_runner_repeated_launch_adopts_existing_process(tmp_path):
+    node = NodeConfig.from_dict(
+        {
+            "name": "local",
+            "ssh": "local",
+            "role": "dedicated",
+            "workspace": str(tmp_path),
+        }
+    )
+    job = JobSpec.from_dict(
+        {
+            "id": f"adopt-{time.time_ns()}",
+            "name": "adopt-existing",
+            "command": "sleep 10",
+        }
+    )
+    runner = PersistentRunner()
+    first = runner.launch(node, job, [0])
+    replay = runner.launch(node, job, [0])
+    assert replay.pid == first.pid
+    assert replay.launch_token == first.launch_token
+    assert replay.process_start_ticks == first.process_start_ticks
+    assert replay.started_at == first.started_at
+    assert runner.cancel(node, replay) is True
 
 
 def test_dashboard_and_rest_plan_submission(tmp_path):
@@ -815,6 +983,56 @@ def test_dashboard_and_rest_plan_submission(tmp_path):
         submitted = json.loads(urllib.request.urlopen(request, timeout=3).read())
         assert submitted["ok"] is True
         assert submitted["plan"]["name"] == "api-plan"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_rest_plan_submission_replay_and_conflict(tmp_path):
+    config = _config(tmp_path)
+    scheduler = Scheduler(
+        config,
+        store=StateStore(config.database),
+        monitor=FakeMonitor([_snapshot()]),
+        runner=FakeRunner(),
+    )
+    server = create_server(scheduler, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/api/plans"
+
+    def submit(command):
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "request_id": "rest-retry-001",
+                    "plan": {
+                        "name": "rest-idempotency",
+                        "jobs": [{"name": "job", "command": command}],
+                    },
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        return urllib.request.urlopen(request, timeout=3)
+
+    try:
+        with submit("echo ok") as first_response:
+            assert first_response.status == 201
+            first = json.loads(first_response.read())
+        with submit("echo ok") as replay_response:
+            assert replay_response.status == 200
+            replay = json.loads(replay_response.read())
+        assert replay["plan"]["id"] == first["plan"]["id"]
+        assert replay["plan"]["submission"]["replayed"] is True
+        with pytest.raises(urllib.error.HTTPError) as conflict:
+            submit("echo changed")
+        assert conflict.value.code == 409
+        payload = json.loads(conflict.value.read())
+        assert payload["code"] == "idempotency_conflict"
     finally:
         server.shutdown()
         server.server_close()

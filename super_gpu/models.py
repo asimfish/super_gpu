@@ -296,6 +296,9 @@ class ExperimentPlan:
     id: str = ""
     max_parallel: int | None = None
     defaults: dict[str, Any] = field(default_factory=dict)
+    request_id: str = ""
+    source: dict[str, Any] = field(default_factory=dict)
+    source_snapshot: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExperimentPlan":
@@ -307,6 +310,9 @@ class ExperimentPlan:
             jobs=jobs,
             max_parallel=int(data["max_parallel"]) if data.get("max_parallel") is not None else None,
             defaults=defaults,
+            request_id=str(data.get("request_id") or ""),
+            source=dict(data.get("source") or {}),
+            source_snapshot=dict(data.get("source_snapshot") or {}),
         )
         plan.validate()
         return plan
@@ -322,6 +328,18 @@ class ExperimentPlan:
             raise ValueError("plan.jobs must contain at least one job")
         if self.max_parallel is not None and self.max_parallel < 1:
             raise ValueError("plan.max_parallel must be positive")
+        if self.request_id and not SAFE_ID.fullmatch(self.request_id):
+            raise ValueError(
+                "request_id must contain only letters, digits, dot, underscore, or dash"
+            )
+        source_mode = str(self.source.get("mode") or "workspace")
+        if source_mode not in {"workspace", "snapshot"}:
+            raise ValueError("source.mode must be workspace or snapshot")
+        if source_mode == "snapshot" and not str(self.source.get("path") or "").strip():
+            raise ValueError("source.path is required when source.mode is snapshot")
+        excludes = self.source.get("exclude", [])
+        if not isinstance(excludes, list) or not all(isinstance(item, str) for item in excludes):
+            raise ValueError("source.exclude must be an array of strings")
         names = [job.name for job in self.jobs]
         if len(names) != len(set(names)):
             raise ValueError("job names must be unique within a plan")
@@ -425,6 +443,9 @@ class RunnerHandle:
     pid: int
     run_dir: str
     started_at: float
+    launch_token: str = ""
+    process_start_ticks: int = 0
+    snapshot_digest: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunnerHandle":
@@ -434,6 +455,9 @@ class RunnerHandle:
             pid=int(data["pid"]),
             run_dir=str(data["run_dir"]),
             started_at=float(data["started_at"]),
+            launch_token=str(data.get("launch_token") or ""),
+            process_start_ticks=int(data.get("process_start_ticks") or 0),
+            snapshot_digest=str(data.get("snapshot_digest") or ""),
         )
 
     def as_dict(self) -> dict[str, Any]:

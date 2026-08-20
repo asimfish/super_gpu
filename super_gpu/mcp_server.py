@@ -40,13 +40,13 @@ def create_mcp(
         return json.dumps(client.get("/api/scheduler"), ensure_ascii=False, indent=2)
 
     @mcp.tool()
-    def experiment_submit(plan_json: str) -> str:
-        """Submit a complete experiment plan JSON object for continuous scheduling."""
+    def experiment_submit(plan_json: str, request_id: str) -> str:
+        """Submit a plan with a stable request ID; retries return the original plan."""
         plan = json.loads(plan_json)
         if not isinstance(plan, dict):
             raise ValueError("plan_json must contain a JSON object")
         return json.dumps(
-            client.post("/api/plans", {"plan": plan}),
+            client.post("/api/plans", {"plan": plan, "request_id": request_id}),
             ensure_ascii=False,
             indent=2,
         )

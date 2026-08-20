@@ -100,6 +100,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     scheduler = _scheduler(args)
     plan = load_plan(args.plan)
+    if args.request_id:
+        plan.request_id = args.request_id
+        plan.validate()
     scheduler.start()
     try:
         submitted = scheduler.submit(plan)
@@ -114,6 +117,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_submit(args: argparse.Namespace) -> int:
     plan_path = Path(args.plan).expanduser()
     raw = json.loads(plan_path.read_text(encoding="utf-8"))
+    if args.request_id:
+        raw["request_id"] = args.request_id
     client = _client(args)
     if client:
         _print(client.post("/api/plans", {"plan": raw}))
@@ -255,10 +260,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="submit a plan and wait for completion")
     run.add_argument("plan")
     run.add_argument("--wait-timeout", type=float)
+    run.add_argument("--request-id", default="", help="stable retry-safe submission ID")
     run.set_defaults(func=cmd_run)
 
     submit = sub.add_parser("submit", help="submit a plan locally or to a daemon")
     submit.add_argument("plan")
+    submit.add_argument("--request-id", default="", help="stable retry-safe submission ID")
     _remote_args(submit)
     submit.set_defaults(func=cmd_submit)
 

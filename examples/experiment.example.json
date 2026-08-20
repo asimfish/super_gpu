@@ -1,5 +1,11 @@
 {
   "name": "learning-rate-sweep",
+  "request_id": "learning-rate-sweep-001",
+  "source": {
+    "mode": "snapshot",
+    "path": ".",
+    "exclude": ["outputs/**", "data/**"]
+  },
   "max_parallel": 12,
   "defaults": {
     "timeout": 86400,

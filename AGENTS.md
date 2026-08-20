@@ -28,13 +28,16 @@ grants server credentials.
 5. Run `super-gpu --config config.json doctor` before submitting work.
 6. Prefer a long-running controller:
    `super-gpu --config config.json serve`.
-7. Submit through MCP `experiment_submit`, the REST `POST /api/plans`, or:
-   `super-gpu submit PLAN.json --url http://127.0.0.1:8765`.
-8. Monitor `experiment_status`, `scheduler_events`, and the dashboard until the
+7. Give every logical submission a stable `request_id`, and reuse that exact ID
+   only when retrying the same plan. Prefer immutable source execution by adding
+   `source: {"mode": "snapshot", "path": "/controller/path/to/project"}`.
+8. Submit through MCP `experiment_submit`, the REST `POST /api/plans`, or:
+   `super-gpu submit PLAN.json --request-id ID --url http://127.0.0.1:8765`.
+9. Monitor `experiment_status`, `scheduler_events`, and the dashboard until the
    plan is `completed`, `failed`, or `cancelled`.
-9. Report failed jobs with their exit code and stderr tail. Do not silently
+10. Report failed jobs with their exit code and stderr tail. Do not silently
    change scientific parameters to make a failed experiment pass.
-10. Do not stop supervising immediately after submission unless the user asks
+11. Do not stop supervising immediately after submission unless the user asks
     for a detached handoff. Stable capacity discovered on later scans is
     automatically backfilled by the controller.
 
@@ -47,6 +50,11 @@ grants server credentials.
   network-level access control.
 - Do not commit real cluster configs, tokens, experiment databases, logs, or
   SSH keys.
+- Treat `source.path` as a path on the controller host. Do not snapshot secret
+  material; default secret-file patterns are excluded and custom exclusions
+  must be recorded in the plan.
+- An `idempotency_conflict` means the request ID was reused for different
+  content. Never bypass it; choose a new ID only for an intentional new run.
 - Cancellation is an external side effect. Only cancel jobs the user requested
   to cancel, or jobs created by the current plan when cleanup was explicitly
   requested.
