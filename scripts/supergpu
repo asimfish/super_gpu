@@ -16,19 +16,49 @@ health() {
   curl --silent --max-time 5 "${URL}/health" 2>/dev/null
 }
 
+api_state() {
+  # A busy machine can exceed a short timeout even when the API is healthy;
+  # retry once before letting status report "no response".
+  local body
+  body="$(curl --silent --max-time 20 "${URL}/api/state" 2>/dev/null)"
+  if [ -z "${body}" ]; then
+    sleep 3
+    body="$(curl --silent --max-time 20 "${URL}/api/state" 2>/dev/null)"
+  fi
+  printf '%s' "${body}"
+}
+
+scheduler_owner() {
+  python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("scheduler", {}).get("owner", ""))
+except (json.JSONDecodeError, OSError):
+    pass
+' 2>/dev/null
+}
+
 is_loaded() {
   launchctl print "${SERVICE}" >/dev/null 2>&1
 }
 
 wait_ready() {
+  previous_owner="${1:-}"
   # A fresh instance waits for the previous database lease to expire
   # (roughly 1-2 minutes) before it can take over. Poll patiently.
-  say "Waiting for the controller (lease takeover usually needs 1-2 min)..."
+  if [ -n "${previous_owner}" ]; then
+    say "Waiting for a new controller owner (lease takeover can need 1-2 min)..."
+  else
+    say "Waiting for the controller (lease takeover can need 1-2 min)..."
+  fi
   for _ in $(seq 1 36); do
     body="$(health)"
     if [ -n "${body}" ] && printf '%s' "${body}" | grep -q '"ok": true'; then
-      say "OK - controller ready: ${URL}"
-      return 0
+      owner="$(printf '%s' "${body}" | scheduler_owner)"
+      if [ -z "${previous_owner}" ] || { [ -n "${owner}" ] && [ "${owner}" != "${previous_owner}" ]; }; then
+        say "OK - controller ready: ${URL} (owner ${owner:-unknown})"
+        return 0
+      fi
     fi
     sleep 5
   done
@@ -59,11 +89,12 @@ cmd_restart() {
     cmd_start
     return
   fi
+  previous_owner="$(health | scheduler_owner)"
   # SIGINT triggers graceful shutdown: the database lease is released and
   # launchd immediately spawns a fresh instance.
   launchctl kill SIGINT "${SERVICE}"
   say "Graceful restart signal sent."
-  wait_ready
+  wait_ready "${previous_owner}"
 }
 
 cmd_status() {
@@ -73,7 +104,7 @@ cmd_status() {
   else
     say "launchd: not loaded"
   fi
-  body="$(health)"
+  body="$(api_state)"
   if [ -z "${body}" ]; then
     say "API: no response (right after a restart wait 1-2 min for lease takeover;"
     say "     if the whole Mac is sluggish, check memory pressure first)"
@@ -88,6 +119,31 @@ age = time.time() - s["last_tick"]
 print("API: healthy | tick %d (last %.0fs ago)" % (s["tick_count"], age))
 print("jobs: running %d / pending %d" % (s["active_jobs"], s["pending_jobs"]))
 print("watchdog: %s | observing %d / active %d" % (w["policy"]["action"], w["observing"], w["active"]))
+snapshots = {item["node"]: item for item in d.get("snapshots", [])}
+nodes = list(d.get("config", {}).get("nodes", []))
+enabled = [node for node in nodes if node.get("enabled", True)]
+online = [node for node in enabled if snapshots.get(node["name"], {}).get("reachable")]
+gpu_total = sum(len(snapshots.get(node["name"], {}).get("gpus", [])) for node in online)
+print("fleet: online %d/%d enabled | %d GPU(s) | %d configured (%d disabled)" % (
+    len(online), len(enabled), gpu_total, len(nodes), len(nodes) - len(enabled)
+))
+for node in sorted(nodes, key=lambda item: (not item.get("enabled", True), -int(item.get("priority", 0)), item["name"])):
+    snapshot = snapshots.get(node["name"], {})
+    if not node.get("enabled", True):
+        state = "DISABLED"
+        gpu_text = "no telemetry"
+    elif snapshot.get("reachable"):
+        state = "ONLINE"
+        gpu_text = "%d GPU(s)" % len(snapshot.get("gpus", []))
+    elif snapshot:
+        state = "OFFLINE"
+        gpu_text = "unreachable"
+    else:
+        state = "WAITING"
+        gpu_text = "no sample"
+    print("  %-24s %-8s %-20s role=%-9s priority=%s" % (
+        node["name"], state, gpu_text, node.get("role", "shared"), node.get("priority", 0)
+    ))
 print("dashboard: %s" % os.environ["URL"])
 '
 }
