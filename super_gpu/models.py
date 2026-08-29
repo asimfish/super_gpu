@@ -10,11 +10,41 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
-TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
+TERMINAL_JOB_STATES = {"completed", "failed", "cancelled", "skipped"}
 ACTIVE_JOB_STATES = {"starting", "running", "cancelling"}
 VALID_NODE_ROLES = {"dedicated", "shared"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SAFE_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Closed taxonomy of job outcomes, richer than an exit code. Lifecycle status
+# says whether a process ran to completion; result_state says what the run
+# *means*: a clean training run and a run that finished only to report "this
+# hypothesis is dead" both exit 0 but must route dependents differently.
+RESULT_STATES = {
+    "success",
+    "scientific_reject",
+    "execution_failure",
+    "infra_failure",
+    "cancelled",
+    "dependency_skipped",
+}
+# States an application may emit via $SUPER_GPU_RESULT_FILE. Control-plane
+# states (infra_failure, cancelled, dependency_skipped, execution_failure)
+# are owned by the scheduler and cannot be claimed by job code.
+APP_RESULT_STATES = {"success", "scientific_reject"}
+DEPENDENCY_MODES = {"success", "complete", "result"}
+
+
+def effective_result_state(status: str, result_state: str) -> str:
+    """Resolve a job's result state, deriving it for legacy rows."""
+    if result_state:
+        return result_state
+    return {
+        "completed": "success",
+        "failed": "execution_failure",
+        "cancelled": "cancelled",
+        "skipped": "dependency_skipped",
+    }.get(status, "")
 
 
 def now_ts() -> float:
@@ -221,6 +251,82 @@ class JobResources:
 
 
 @dataclass
+class JobDependency:
+    """One dependency edge with an explicit satisfaction predicate.
+
+    ``after`` semantics:
+      - ``success``  (default): upstream completed with result state success.
+      - ``complete``: upstream reached any terminal state.
+      - ``result``: upstream terminal and its result state is listed in
+        ``result_states``.
+    When the upstream is terminal but the predicate cannot hold, the
+    dependent job is skipped with result state ``dependency_skipped``.
+    """
+
+    job: str
+    after: str = "success"
+    result_states: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "JobDependency":
+        if isinstance(value, str):
+            dependency = cls(job=value)
+        elif isinstance(value, dict):
+            dependency = cls(
+                job=str(value.get("job") or "").strip(),
+                after=str(value.get("after") or ("result" if value.get("result_states") else "success")),
+                result_states=[str(item) for item in value.get("result_states", [])],
+            )
+        else:
+            raise ValueError(f"dependency entries must be strings or objects, got {value!r}")
+        dependency.validate()
+        return dependency
+
+    def validate(self) -> None:
+        if not self.job:
+            raise ValueError("dependency.job is required")
+        if self.after not in DEPENDENCY_MODES:
+            raise ValueError(
+                f"dependency on {self.job!r}: after must be one of {sorted(DEPENDENCY_MODES)}"
+            )
+        if self.after == "result":
+            if not self.result_states:
+                raise ValueError(
+                    f"dependency on {self.job!r}: after=result requires result_states"
+                )
+            unknown = set(self.result_states) - RESULT_STATES
+            if unknown:
+                raise ValueError(
+                    f"dependency on {self.job!r}: unknown result_states {sorted(unknown)}"
+                )
+        elif self.result_states:
+            raise ValueError(
+                f"dependency on {self.job!r}: result_states requires after=result"
+            )
+
+    def as_value(self) -> Any:
+        """Compact serialization: plain string for the default predicate."""
+        if self.after == "success":
+            return self.job
+        payload: dict[str, Any] = {"job": self.job, "after": self.after}
+        if self.after == "result":
+            payload["result_states"] = list(self.result_states)
+        return payload
+
+    def gate(self, status: str, result_state: str) -> str:
+        """Return 'satisfied', 'wait', or 'skip' for the upstream's state."""
+        terminal = status in TERMINAL_JOB_STATES
+        if self.after == "complete":
+            return "satisfied" if terminal else "wait"
+        if not terminal:
+            return "wait"
+        effective = effective_result_state(status, result_state)
+        if self.after == "success":
+            return "satisfied" if effective == "success" else "skip"
+        return "satisfied" if effective in self.result_states else "skip"
+
+
+@dataclass
 class JobSpec:
     name: str
     command: str
@@ -234,7 +340,7 @@ class JobSpec:
     timeout: float = 86400.0
     max_retries: int = 0
     retry_delay: float = 10.0
-    dependencies: list[str] = field(default_factory=list)
+    dependencies: list[JobDependency] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], defaults: dict[str, Any] | None = None) -> "JobSpec":
@@ -256,7 +362,10 @@ class JobSpec:
             timeout=float(merged.get("timeout", 86400)),
             max_retries=int(merged.get("max_retries", 0)),
             retry_delay=float(merged.get("retry_delay", 10)),
-            dependencies=[str(x) for x in merged.get("dependencies", [])],
+            dependencies=[
+                JobDependency.from_value(entry)
+                for entry in merged.get("dependencies", [])
+            ],
         )
         job.validate()
         return job
@@ -277,6 +386,8 @@ class JobSpec:
         invalid_env = [key for key in self.env if not SAFE_ENV_KEY.fullmatch(key)]
         if invalid_env:
             raise ValueError(f"job {self.name!r}: invalid environment keys {invalid_env}")
+        for dependency in self.dependencies:
+            dependency.validate()
         self.resources.validate()
 
     def fingerprint(self) -> str:
@@ -345,7 +456,7 @@ class ExperimentPlan:
             raise ValueError("job names must be unique within a plan")
         known = set(names)
         for job in self.jobs:
-            missing = set(job.dependencies) - known
+            missing = {dependency.job for dependency in job.dependencies} - known
             if missing:
                 raise ValueError(f"job {job.name!r}: unknown dependencies {sorted(missing)}")
 

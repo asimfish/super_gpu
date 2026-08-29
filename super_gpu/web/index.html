@@ -557,6 +557,7 @@
     .status.failed { color: var(--red); background: rgba(255,113,125,.1); }
     .status.pending { color: var(--amber); background: rgba(255,199,107,.1); }
     .status.cancelled, .status.cancelling { color: var(--violet); background: rgba(185,156,255,.1); }
+    .status.skipped { color: var(--muted); background: rgba(140,150,166,.12); }
 
     .events {
       max-height: 520px;
@@ -998,7 +999,11 @@
         const canCancel = ["pending", "starting", "running"].includes(job.status);
         return `<tr>
           <td class="name" title="${esc(job.id)}">${esc(job.name)}<br><span style="color:#667489;font-size:9px">${esc(job.plan_id)}</span></td>
-          <td><span class="status ${esc(job.status)}">${esc(job.status)}</span></td>
+          <td><span class="status ${esc(job.status)}">${esc(job.status)}</span>${
+            job.result_state && !["success", ""].includes(job.result_state) && job.result_state !== job.status
+              ? `<br><span style="color:#8a93a6;font-size:9px">${esc(job.result_state)}</span>`
+              : ""
+          }</td>
           <td>${placement}</td>
           <td>${estimate.memory_mib ? `${fmtMib(estimate.memory_mib)} · ${esc(estimate.source)}` : "auto"}</td>
           <td>${job.attempt}/${Number(job.max_retries || 0) + 1}</td>

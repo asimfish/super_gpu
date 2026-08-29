@@ -107,7 +107,8 @@ def test_example_config_and_plan_validate(tmp_path):
     assert "env" not in config.public_dict()["nodes"][0]
     assert config.public_dict()["nodes"][0]["env_keys"] == []
     assert len(plan.jobs) == 3
-    assert plan.jobs[2].dependencies == ["baseline"]
+    assert [dep.job for dep in plan.jobs[2].dependencies] == ["baseline"]
+    assert plan.jobs[2].dependencies[0].after == "success"
 
     path = tmp_path / "bad.json"
     path.write_text(json.dumps({"nodes": []}), encoding="utf-8")
@@ -859,11 +860,128 @@ def test_failed_dependency_propagates_to_downstream_jobs(tmp_path):
     )
     first = next(job for job in submitted["jobs"] if job["name"] == "a")
     store.finish_job(first["id"], status="failed", exit_code=1, error="boom")
-    blocked = store.fail_blocked_dependencies()
-    assert {item["name"] for item in blocked} == {"b", "c"}
+    skipped = store.resolve_dependency_gates()
+    assert {item["name"] for item in skipped} == {"b", "c"}
     plan = store.get_plan(submitted["id"], include_jobs=True)
     assert plan["status"] == "failed"
-    assert all(job["status"] == "failed" for job in plan["jobs"])
+    jobs = {job["name"]: job for job in plan["jobs"]}
+    assert jobs["a"]["status"] == "failed"
+    assert jobs["a"]["result_state"] == "execution_failure"
+    assert jobs["b"]["status"] == "skipped"
+    assert jobs["b"]["result_state"] == "dependency_skipped"
+    assert "dependency not satisfiable" in jobs["b"]["error"]
+    assert jobs["c"]["status"] == "skipped"
+
+
+def test_dependency_predicates_route_on_typed_results(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    submitted = store.submit_plan(
+        ExperimentPlan.from_dict(
+            {
+                "name": "routing-plan",
+                "jobs": [
+                    {"name": "probe", "command": "python probe.py"},
+                    {
+                        "name": "scale-up",
+                        "command": "python train.py --large",
+                        "dependencies": ["probe"],
+                    },
+                    {
+                        "name": "salvage",
+                        "command": "python salvage.py",
+                        "dependencies": [
+                            {"job": "probe", "after": "result", "result_states": ["scientific_reject"]}
+                        ],
+                    },
+                    {
+                        "name": "archive",
+                        "command": "python archive.py",
+                        "dependencies": [{"job": "probe", "after": "complete"}],
+                    },
+                ],
+            }
+        )
+    )
+    jobs = {job["name"]: job for job in submitted["jobs"]}
+    assert [job["name"] for job in store.runnable_jobs()] == ["probe"]
+
+    store.finish_job(
+        jobs["probe"]["id"],
+        status="completed",
+        exit_code=0,
+        result_state="scientific_reject",
+        result={"reason": "loss diverged on all seeds"},
+    )
+    runnable = {job["name"] for job in store.runnable_jobs()}
+    assert runnable == {"salvage", "archive"}
+
+    skipped = store.resolve_dependency_gates()
+    assert {item["name"] for item in skipped} == {"scale-up"}
+    probe = store.get_job(jobs["probe"]["id"])
+    assert probe["result_state"] == "scientific_reject"
+    assert probe["result"] == {"reason": "loss diverged on all seeds"}
+
+    for name in ("salvage", "archive"):
+        store.finish_job(jobs[name]["id"], status="completed", exit_code=0)
+    plan = store.get_plan(submitted["id"])
+    assert plan["status"] == "completed"
+
+
+def test_dependency_predicate_validation():
+    with pytest.raises(ValueError, match="after must be one of"):
+        JobSpec.from_dict(
+            {
+                "name": "bad",
+                "command": "echo",
+                "dependencies": [{"job": "x", "after": "sometimes"}],
+            }
+        )
+    with pytest.raises(ValueError, match="requires result_states"):
+        JobSpec.from_dict(
+            {
+                "name": "bad",
+                "command": "echo",
+                "dependencies": [{"job": "x", "after": "result"}],
+            }
+        )
+    with pytest.raises(ValueError, match="unknown result_states"):
+        JobSpec.from_dict(
+            {
+                "name": "bad",
+                "command": "echo",
+                "dependencies": [
+                    {"job": "x", "after": "result", "result_states": ["победа"]}
+                ],
+            }
+        )
+    spec = JobSpec.from_dict(
+        {
+            "name": "ok",
+            "command": "echo",
+            "dependencies": [
+                "plain",
+                {"job": "typed", "result_states": ["scientific_reject"]},
+            ],
+        }
+    )
+    assert spec.dependencies[0].as_value() == "plain"
+    assert spec.dependencies[1].after == "result"
+
+
+def test_interpret_app_result_honors_whitelist_only():
+    from super_gpu.scheduler import interpret_app_result
+
+    assert interpret_app_result("") == ("success", {})
+    state, meta = interpret_app_result('{"state": "scientific_reject", "metric": 0.42}')
+    assert state == "scientific_reject"
+    assert meta == {"metric": 0.42}
+    state, meta = interpret_app_result('{"state": "infra_failure"}')
+    assert state == "success"
+    assert "not an application-emittable" in meta["result_warning"]
+    state, meta = interpret_app_result("not json at all")
+    assert state == "success"
+    assert "not valid JSON" in meta["result_warning"]
 
 
 class FakeMonitor:
@@ -968,6 +1086,76 @@ def test_scheduler_keeps_lease_when_process_identity_is_unverified(tmp_path):
     assert store.leases(active_only=True)[0]["job_id"] == job["id"]
     assert any(event["kind"] == "job_identity_unverified" for event in store.list_events())
     store.release_controller(scheduler.owner)
+
+
+class ScientificRejectRunner(FakeRunner):
+    def poll(self, node, handle):
+        status = super().poll(node, handle)
+        if status.state == "finished":
+            status.result_raw = '{"state": "scientific_reject", "verdict": "hypothesis dead"}'
+        return status
+
+
+def test_scheduler_stores_app_emitted_result_and_routes_dependents(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    runner = ScientificRejectRunner()
+    scheduler = Scheduler(
+        config, store=store, monitor=FakeMonitor([_snapshot()]), runner=runner
+    )
+    submitted = scheduler.submit(
+        ExperimentPlan.from_dict(
+            {
+                "name": "typed-results",
+                "jobs": [
+                    {"name": "probe", "command": "python probe.py"},
+                    {"name": "scale-up", "command": "echo big", "dependencies": ["probe"]},
+                ],
+            }
+        )
+    )
+    scheduler.run_once()
+    runner.finish_all()
+    scheduler.run_once()
+    scheduler.run_once()
+    jobs = {job["name"]: job for job in store.list_jobs(plan_id=submitted["id"])}
+    assert jobs["probe"]["status"] == "completed"
+    assert jobs["probe"]["result_state"] == "scientific_reject"
+    assert jobs["probe"]["result"] == {"verdict": "hypothesis dead"}
+    assert jobs["scale-up"]["status"] == "skipped"
+    assert jobs["scale-up"]["result_state"] == "dependency_skipped"
+    assert any(event["kind"] == "job_skipped" for event in store.list_events())
+    store.release_controller(scheduler.owner)
+
+
+def test_local_runner_captures_result_file(tmp_path):
+    node = NodeConfig.from_dict(
+        {
+            "name": "local",
+            "ssh": "local",
+            "role": "dedicated",
+            "workspace": str(tmp_path),
+        }
+    )
+    job = JobSpec.from_dict(
+        {
+            "id": f"result-{time.time_ns()}",
+            "name": "result-test",
+            "command": (
+                "printf '{\"state\": \"scientific_reject\", \"metric\": 0.1}' "
+                "> \"$SUPER_GPU_RESULT_FILE\""
+            ),
+        }
+    )
+    runner = PersistentRunner()
+    handle = runner.launch(node, job, [0])
+    deadline = time.time() + 5
+    status = runner.poll(node, handle)
+    while not status.finished and time.time() < deadline:
+        time.sleep(0.05)
+        status = runner.poll(node, handle)
+    assert status.exit_code == 0
+    assert json.loads(status.result_raw) == {"state": "scientific_reject", "metric": 0.1}
 
 
 def test_local_persistent_runner_writes_logs(tmp_path):

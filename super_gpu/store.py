@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import (
+    RESULT_STATES,
     ExperimentPlan,
+    JobDependency,
     JobSpec,
     NodeSnapshot,
     Placement,
@@ -75,6 +77,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   stderr_tail TEXT NOT NULL DEFAULT '',
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   pending_reason TEXT NOT NULL DEFAULT '',
+  result_state TEXT NOT NULL DEFAULT '',
+  result_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(plan_id, name)
 );
 
@@ -140,6 +144,8 @@ CREATE TABLE IF NOT EXISTS watchdog_observations (
 # tables, so each new jobs column needs an entry here as well.
 JOBS_COLUMN_MIGRATIONS: dict[str, str] = {
     "pending_reason": "TEXT NOT NULL DEFAULT ''",
+    "result_state": "TEXT NOT NULL DEFAULT ''",
+    "result_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 
@@ -189,7 +195,7 @@ def _plan_payload(plan: ExperimentPlan, plan_id: str) -> dict[str, Any]:
                 "timeout": job.timeout,
                 "max_retries": job.max_retries,
                 "retry_delay": job.retry_delay,
-                "dependencies": job.dependencies,
+                "dependencies": [dep.as_value() for dep in job.dependencies],
             }
             for job in plan.jobs
         ],
@@ -256,6 +262,7 @@ class StateStore:
             ("estimate_json", "estimate", {}),
             ("gpus_json", "gpus", []),
             ("handle_json", "handle", {}),
+            ("result_json", "result", {}),
         ):
             item[target] = _loads(item.pop(source), fallback)
         item["cancel_requested"] = bool(item["cancel_requested"])
@@ -337,7 +344,7 @@ class StateStore:
                                         "allow_colocation": job.resources.allow_colocation,
                                     }
                                 ),
-                                _json(job.dependencies),
+                                _json([dep.as_value() for dep in job.dependencies]),
                                 job.timeout,
                                 job.max_retries,
                                 job.retry_delay,
@@ -440,13 +447,13 @@ class StateStore:
         pending = self.list_jobs(statuses=["pending"], limit=10000)
         if not pending:
             return []
-        plan_jobs: dict[str, dict[str, str]] = {}
+        plan_jobs: dict[str, dict[str, tuple[str, str]]] = {}
         with self.connect() as conn:
             for plan_id in {job["plan_id"] for job in pending}:
                 plan_jobs[plan_id] = {
-                    row["name"]: row["status"]
+                    row["name"]: (row["status"], row["result_state"])
                     for row in conn.execute(
-                        "SELECT name, status FROM jobs WHERE plan_id=?",
+                        "SELECT name, status, result_state FROM jobs WHERE plan_id=?",
                         (plan_id,),
                     ).fetchall()
                 }
@@ -461,17 +468,17 @@ class StateStore:
                         f"in retry backoff after attempt {job['attempt']}",
                     )
                 continue
-            statuses = plan_jobs.get(job["plan_id"], {})
-            unmet = [
-                dependency
-                for dependency in job["dependencies"]
-                if statuses.get(dependency) != "completed"
-            ]
+            states = plan_jobs.get(job["plan_id"], {})
+            unmet = []
+            for entry in job["dependencies"]:
+                dependency = JobDependency.from_value(entry)
+                status, result_state = states.get(dependency.job, ("missing", ""))
+                if dependency.gate(status, result_state) != "satisfied":
+                    unmet.append((dependency.job, status))
             if unmet:
                 if annotate:
                     detail = ", ".join(
-                        f"{dependency} ({statuses.get(dependency, 'missing')})"
-                        for dependency in unmet[:5]
+                        f"{name} ({status})" for name, status in unmet[:5]
                     )
                     self.set_pending_reason(
                         job["id"], f"waiting for dependencies: {detail}"
@@ -492,13 +499,16 @@ class StateStore:
                 (normalized, job_id, normalized),
             )
 
-    def fail_blocked_dependencies(self) -> list[dict[str, Any]]:
-        """Fail pending jobs whose upstream dependency cannot complete.
+    def resolve_dependency_gates(self) -> list[dict[str, Any]]:
+        """Skip pending jobs whose dependency predicate can no longer hold.
 
-        Propagation is iterative so A -> B -> C resolves in one scheduler tick
-        when A fails.
+        A dependency that reached a terminal state without satisfying its
+        predicate (default: completed with result state success) makes the
+        dependent job terminal as ``skipped`` with result state
+        ``dependency_skipped``. Propagation is iterative so A -> B -> C
+        resolves in one scheduler tick when A fails.
         """
-        blocked: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -512,43 +522,60 @@ class StateStore:
                     ]
                     for plan_id in plan_ids:
                         rows = conn.execute(
-                            "SELECT id, name, status, dependencies_json FROM jobs WHERE plan_id=?",
+                            """
+                            SELECT id, name, status, result_state, dependencies_json
+                            FROM jobs WHERE plan_id=?
+                            """,
                             (plan_id,),
                         ).fetchall()
-                        statuses = {row["name"]: row["status"] for row in rows}
+                        states = {
+                            row["name"]: (row["status"], row["result_state"])
+                            for row in rows
+                        }
                         for row in rows:
                             if row["status"] != "pending":
                                 continue
-                            dependencies = _loads(row["dependencies_json"], [])
-                            failed = [
-                                dependency
-                                for dependency in dependencies
-                                if statuses.get(dependency) in {"failed", "cancelled"}
-                            ]
-                            if not failed:
+                            unsatisfiable = []
+                            for entry in _loads(row["dependencies_json"], []):
+                                dependency = JobDependency.from_value(entry)
+                                status, result_state = states.get(
+                                    dependency.job, ("missing", "")
+                                )
+                                if dependency.gate(status, result_state) == "skip":
+                                    unsatisfiable.append(
+                                        f"{dependency.job} finished as "
+                                        f"{result_state or status} "
+                                        f"(needs after={dependency.after}"
+                                        + (
+                                            f" {dependency.result_states}"
+                                            if dependency.after == "result"
+                                            else ""
+                                        )
+                                        + ")"
+                                    )
+                            if not unsatisfiable:
                                 continue
-                            error = (
-                                "blocked because dependencies did not complete: "
-                                + ", ".join(failed)
+                            error = "dependency not satisfiable: " + "; ".join(
+                                unsatisfiable
                             )
                             conn.execute(
                                 """
                                 UPDATE jobs
-                                SET status='failed', error=?, finished_at=?
+                                SET status='skipped', result_state='dependency_skipped',
+                                    error=?, finished_at=?, pending_reason=''
                                 WHERE id=? AND status='pending'
                                 """,
                                 (error, now_ts(), row["id"]),
                             )
-                            blocked.append(
+                            skipped.append(
                                 {
                                     "id": row["id"],
                                     "name": row["name"],
                                     "plan_id": plan_id,
-                                    "dependencies": failed,
                                     "error": error,
                                 }
                             )
-                            statuses[row["name"]] = "failed"
+                            states[row["name"]] = ("skipped", "dependency_skipped")
                             changed += 1
                     if not changed:
                         break
@@ -556,9 +583,9 @@ class StateStore:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-        for item in blocked:
+        for item in skipped:
             self.refresh_plan_for_job(item["id"])
-        return blocked
+        return skipped
 
     def active_count(self, plan_id: str | None = None) -> int:
         args: list[Any] = []
@@ -681,9 +708,24 @@ class StateStore:
         error: str = "",
         stdout_tail: str = "",
         stderr_tail: str = "",
+        result_state: str = "",
+        result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in {"completed", "failed", "cancelled"}:
             raise ValueError(f"invalid terminal status: {status}")
+        if result_state and result_state not in RESULT_STATES:
+            raise ValueError(f"invalid result state: {result_state}")
+        if not result_state:
+            result_state = {
+                "completed": "success",
+                "failed": "execution_failure",
+                "cancelled": "cancelled",
+            }[status]
+        result_payload = _json(result or {})
+        if len(result_payload) > 8000:
+            result_payload = _json(
+                {"result_warning": "result metadata exceeded 8000 characters and was dropped"}
+            )
         timestamp = now_ts()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -691,7 +733,7 @@ class StateStore:
                 """
                 UPDATE jobs
                 SET status=?, exit_code=?, error=?, stdout_tail=?, stderr_tail=?,
-                    finished_at=?, handle_json='{}'
+                    finished_at=?, handle_json='{}', result_state=?, result_json=?
                 WHERE id=?
                 """,
                 (
@@ -701,6 +743,8 @@ class StateStore:
                     stdout_tail[-12000:],
                     stderr_tail[-12000:],
                     timestamp,
+                    result_state,
+                    result_payload,
                     job_id,
                 ),
             )
@@ -733,6 +777,7 @@ class StateStore:
                 next_run_at = 0.0
                 finished_at: float | None = timestamp
                 pending_reason = ""
+                result_state = "cancelled"
             elif int(row["attempt"]) <= int(row["max_retries"]):
                 status = "pending"
                 next_run_at = timestamp + float(row["retry_delay"])
@@ -741,17 +786,21 @@ class StateStore:
                     f"retry scheduled in {float(row['retry_delay']):g}s "
                     f"(attempt {int(row['attempt'])} of {int(row['max_retries']) + 1} failed)"
                 )
+                result_state = ""
             else:
                 status = "failed"
                 next_run_at = 0.0
                 finished_at = timestamp
                 pending_reason = ""
+                # exit_code None means the process never ran or was lost by
+                # the platform rather than failing on its own.
+                result_state = "infra_failure" if exit_code is None else "execution_failure"
             conn.execute(
                 """
                 UPDATE jobs
                 SET status=?, exit_code=?, error=?, stdout_tail=?, stderr_tail=?,
                     finished_at=?, next_run_at=?, handle_json='{}', node='', gpus_json='[]',
-                    pending_reason=?
+                    pending_reason=?, result_state=?
                 WHERE id=?
                 """,
                 (
@@ -763,6 +812,7 @@ class StateStore:
                     finished_at,
                     next_run_at,
                     pending_reason,
+                    result_state,
                     job_id,
                 ),
             )
@@ -964,8 +1014,18 @@ class StateStore:
         if all(status == "completed" for status in statuses):
             status = "completed"
             finished = now_ts()
-        elif all(status in {"completed", "failed", "cancelled"} for status in statuses):
-            status = "failed" if "failed" in statuses else "cancelled"
+        elif all(
+            status in {"completed", "failed", "cancelled", "skipped"}
+            for status in statuses
+        ):
+            # Skipped jobs reflect deliberate routing (for example a
+            # scientific_reject upstream), not a plan failure by themselves.
+            if "failed" in statuses:
+                status = "failed"
+            elif "cancelled" in statuses:
+                status = "cancelled"
+            else:
+                status = "completed"
             finished = now_ts()
         elif any(status in {"starting", "running", "cancelling"} for status in statuses):
             status = "running"
