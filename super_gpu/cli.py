@@ -188,6 +188,16 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0 if payload.get("ok") else 1
 
 
+def cmd_pull(args: argparse.Namespace) -> int:
+    from .outputs import pull_job_outputs
+
+    cfg = load_config(args.config)
+    store = StateStore(cfg.database)
+    summary = pull_job_outputs(cfg, store, args.job_id, args.dest)
+    _print({"ok": True, "pull": summary})
+    return 0
+
+
 def cmd_events(args: argparse.Namespace) -> int:
     client = _client(args)
     if client:
@@ -289,6 +299,15 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("job_id")
     _remote_args(cancel)
     cancel.set_defaults(func=cmd_cancel)
+
+    pull = sub.add_parser("pull", help="fetch a finished job's declared outputs")
+    pull.add_argument("job_id")
+    pull.add_argument(
+        "--dest",
+        default="./outputs",
+        help="local directory; files land in <dest>/<job-name>/",
+    )
+    pull.set_defaults(func=cmd_pull)
 
     events = sub.add_parser("events", help="show scheduler events")
     events.add_argument("--limit", type=int, default=100)

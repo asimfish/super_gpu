@@ -78,6 +78,15 @@ def create_mcp(
         )
 
     @mcp.tool()
+    def experiment_outputs(job_id: str) -> str:
+        """List a finished job's declared output files (expanded on the node, no transfer)."""
+        return json.dumps(
+            client.get(f"/api/jobs/{job_id}/outputs"),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @mcp.tool()
     def scheduler_events(limit: int = 100) -> str:
         """Return recent placement, completion, retry, and controller events."""
         return json.dumps(

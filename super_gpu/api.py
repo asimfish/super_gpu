@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .models import ExperimentPlan
+from .outputs import describe_job_outputs
 from .scheduler import Scheduler
 from .store import IdempotencyConflict
 
@@ -169,6 +170,23 @@ class SuperGPUHandler(BaseHTTPRequestHandler):
                 limit=int(params.get("limit", ["500"])[0]),
             )
             self._json(200, {"ok": True, "jobs": jobs})
+            return
+        if path.startswith("/api/jobs/") and path.endswith("/outputs"):
+            job_id = path.removeprefix("/api/jobs/").removesuffix("/outputs").strip("/")
+            try:
+                manifest = describe_job_outputs(
+                    self.server.scheduler.config,
+                    self.server.scheduler.store,
+                    job_id,
+                )
+            except ValueError as exc:
+                status = 404 if str(exc).startswith("unknown job") else 400
+                self._json(status, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001 - remote expansion may fail
+                self._json(502, {"ok": False, "error": str(exc)})
+                return
+            self._json(200, {"ok": True, "outputs": manifest})
             return
         if path.startswith("/api/jobs/"):
             job_id = path.removeprefix("/api/jobs/").strip("/")

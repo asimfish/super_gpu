@@ -1365,3 +1365,132 @@ def test_rest_plan_submission_replay_and_conflict(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_output_pattern_validation():
+    good = JobSpec.from_dict(
+        {
+            "name": "train",
+            "command": "true",
+            "outputs": ["results/*.json", "checkpoints/**/*.pt", "metrics.csv"],
+        }
+    )
+    good.validate()
+    for bad in ["/etc/passwd", "~/stash", "logs/../../etc", "has space.txt", "  "]:
+        with pytest.raises(ValueError):
+            JobSpec.from_dict(
+                {"name": "train", "command": "true", "outputs": [bad]}
+            ).validate()
+
+
+def test_resolve_workspace_prefers_snapshot_run_dir():
+    from super_gpu.outputs import resolve_workspace
+
+    node = NodeConfig(name="gpu-main", ssh="local", workspace="~/work")
+    job = {"name": "train", "run_dir": "/runs/job-1"}
+    with_snapshot = {"plan": {"source_snapshot": {"digest": "a" * 64}}}
+    assert resolve_workspace(job, with_snapshot, node) == "/runs/job-1/workspace"
+    assert resolve_workspace(job, {"plan": {}}, node) == "~/work"
+    with pytest.raises(ValueError):
+        resolve_workspace({"name": "train"}, with_snapshot, node)
+
+
+def test_pull_job_outputs_end_to_end(tmp_path):
+    from super_gpu.outputs import describe_job_outputs, pull_job_outputs
+
+    workspace = tmp_path / "ws"
+    (workspace / "results").mkdir(parents=True)
+    (workspace / "results" / "metrics.json").write_text('{"acc": 0.9}', encoding="utf-8")
+    (workspace / "results" / "notes.txt").write_text("not declared", encoding="utf-8")
+    (workspace / "checkpoints" / "deep").mkdir(parents=True)
+    (workspace / "checkpoints" / "deep" / "model.pt").write_bytes(b"\x00\x01binary\xff")
+    (workspace / "secret.env").write_text("KEY=nope", encoding="utf-8")
+
+    config = _config(
+        tmp_path,
+        nodes=[
+            {
+                "name": "gpu-main",
+                "ssh": "local",
+                "role": "dedicated",
+                "workspace": str(workspace),
+            }
+        ],
+    )
+    store = StateStore(config.database)
+    submitted = store.submit_plan(
+        ExperimentPlan.from_dict(
+            {
+                "name": "pull-plan",
+                "jobs": [
+                    {
+                        "name": "train",
+                        "command": "true",
+                        "outputs": ["results/*.json", "checkpoints"],
+                    }
+                ],
+            }
+        )
+    )
+    job_id = submitted["jobs"][0]["id"]
+
+    # Not terminal yet: pull must refuse.
+    with pytest.raises(ValueError, match="terminal"):
+        pull_job_outputs(config, store, job_id, tmp_path / "dl")
+
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='completed', node='gpu-main' WHERE id=?",
+            (job_id,),
+        )
+
+    manifest = describe_job_outputs(config, store, job_id)
+    assert manifest["files"] == [
+        "checkpoints/deep/model.pt",
+        "results/metrics.json",
+    ]
+
+    summary = pull_job_outputs(config, store, job_id, tmp_path / "dl")
+    assert summary["pulled"] == 2
+    dest = Path(summary["destination"])
+    assert dest == tmp_path / "dl" / "train"
+    assert (dest / "results" / "metrics.json").read_text(encoding="utf-8") == '{"acc": 0.9}'
+    assert (dest / "checkpoints" / "deep" / "model.pt").read_bytes() == b"\x00\x01binary\xff"
+    assert not (dest / "results" / "notes.txt").exists()
+    assert not (dest / "secret.env").exists()
+    assert not (dest / ".super_gpu_outputs.tar.gz").exists()
+
+
+def test_pull_job_outputs_requires_declared_outputs(tmp_path):
+    from super_gpu.outputs import pull_job_outputs
+
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    submitted = store.submit_plan(
+        ExperimentPlan.from_dict(
+            {"name": "no-outputs", "jobs": [{"name": "job", "command": "true"}]}
+        )
+    )
+    job_id = submitted["jobs"][0]["id"]
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='completed', node='gpu-main' WHERE id=?",
+            (job_id,),
+        )
+    with pytest.raises(ValueError, match="declares no outputs"):
+        pull_job_outputs(config, store, job_id, tmp_path / "dl")
+    with pytest.raises(ValueError, match="unknown job"):
+        pull_job_outputs(config, store, "job_missing", tmp_path / "dl")
+
+
+def test_download_archive_rejects_unsafe_members(tmp_path):
+    transport = CommandTransport()
+    node = NodeConfig(name="gpu-main", ssh="local", workspace=str(tmp_path))
+    for unsafe in ["/etc/passwd", "../escape", "a/../../b", "bad\nname"]:
+        result = transport.download_archive(
+            node, str(tmp_path), [unsafe], tmp_path / "out.tar.gz"
+        )
+        assert not result.ok
+        assert "unsafe archive member" in result.stderr
+    empty = transport.download_archive(node, str(tmp_path), [], tmp_path / "out.tar.gz")
+    assert not empty.ok
