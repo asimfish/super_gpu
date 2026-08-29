@@ -1,6 +1,7 @@
 """Continuous resource-aware experiment scheduler."""
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -12,6 +13,7 @@ from typing import Any
 from .estimator import ResourceEstimator
 from .guardian import IdleGpuGuardian
 from .models import (
+    APP_RESULT_STATES,
     ExperimentPlan,
     JobSpec,
     NodeSnapshot,
@@ -24,6 +26,33 @@ from .placement import PlacementEngine
 from .runner import PersistentRunner
 from .source_snapshot import SourceSnapshotStore
 from .store import StateStore
+
+
+def interpret_app_result(raw: str) -> tuple[str, dict[str, Any]]:
+    """Interpret an application-emitted result file for a zero-exit job.
+
+    Only whitelisted application states are honored; anything malformed is
+    ignored (the job still counts as success) but leaves an explicit warning
+    in the stored result metadata so silent contract violations surface.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "success", {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return "success", {"result_warning": "result file was not valid JSON; ignored"}
+    if not isinstance(payload, dict):
+        return "success", {"result_warning": "result file must be a JSON object; ignored"}
+    state = str(payload.get("state") or "")
+    if state not in APP_RESULT_STATES:
+        return "success", {
+            "result_warning": (
+                f"state {state!r} is not an application-emittable result state; ignored"
+            )
+        }
+    metadata = {key: value for key, value in payload.items() if key != "state"}
+    return state, metadata
 
 
 class Scheduler:
@@ -121,11 +150,11 @@ class Scheduler:
         self._track_reachability(snapshots)
         self._reconcile_running(snapshots)
         self._inspect_watchdog(snapshots)
-        for blocked in self.store.fail_blocked_dependencies():
+        for skipped in self.store.resolve_dependency_gates():
             self.store.add_event(
-                "job_blocked",
-                f"job {blocked['name']} blocked by failed dependencies",
-                blocked,
+                "job_skipped",
+                f"job {skipped['name']} skipped: dependency predicate not satisfiable",
+                skipped,
             )
         self._schedule_pending(snapshots)
         self.store.refresh_all_plans()
@@ -303,12 +332,15 @@ class Scheduler:
             duration = max(0.0, time.time() - handle.started_at)
             peak_memory = max(int(row.get("peak_memory_mib") or 0), peak_memory)
             if status.exit_code == 0:
+                result_state, result_meta = interpret_app_result(status.result_raw)
                 self.store.finish_job(
                     row["id"],
                     status="completed",
                     exit_code=0,
                     stdout_tail=status.stdout_tail,
                     stderr_tail=status.stderr_tail,
+                    result_state=result_state,
+                    result=result_meta,
                 )
                 self.estimator.observe(
                     job,
@@ -323,6 +355,7 @@ class Scheduler:
                         "node": row["node"],
                         "gpus": row["gpus"],
                         "duration_seconds": duration,
+                        "result_state": result_state,
                     },
                 )
             else:

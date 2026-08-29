@@ -65,7 +65,7 @@ if [ -n "${SUPER_GPU_SNAPSHOT_DIGEST:-}" ]; then
 fi
 printf '%s\n' "$SUPER_GPU_COMMAND" > "$run_dir/command.sh"
 chmod 700 "$run_dir/command.sh"
-rm -f "$run_dir/exit_code" "$run_dir/finished_at" "$run_dir/identity" "$run_dir/pid" "$run_dir/cancelled"
+rm -f "$run_dir/exit_code" "$run_dir/finished_at" "$run_dir/identity" "$run_dir/pid" "$run_dir/cancelled" "$run_dir/result.json"
 cat > "$run_dir/wrapper.sh" <<'SUPER_GPU_WRAPPER'
 #!/usr/bin/env bash
 set +e
@@ -82,6 +82,7 @@ start_ticks=${start_ticks:-0}
 identity_tmp="$run_dir/identity.$$"
 printf '%s\n%s\n%s\n%s\n' "$SUPER_GPU_LAUNCH_TOKEN" "$$" "$start_ticks" "$SUPER_GPU_STARTED_AT" > "$identity_tmp"
 mv "$identity_tmp" "$run_dir/identity"
+export SUPER_GPU_RESULT_FILE="$run_dir/result.json"
 bash "$run_dir/command.sh" >"$run_dir/stdout.log" 2>"$run_dir/stderr.log"
 rc=$?
 tmp="$run_dir/exit_code.$$"
@@ -150,6 +151,8 @@ echo "__SUPER_GPU_STDOUT__"
 tail -n 100 "$run_dir/stdout.log" 2>/dev/null || true
 echo "__SUPER_GPU_STDERR__"
 tail -n 100 "$run_dir/stderr.log" 2>/dev/null || true
+echo "__SUPER_GPU_RESULT__"
+head -c 4096 "$run_dir/result.json" 2>/dev/null || true
 """
 
 
@@ -195,6 +198,7 @@ class RunnerStatus:
     stdout_tail: str
     stderr_tail: str
     error: str = ""
+    result_raw: str = ""
 
     @property
     def finished(self) -> bool:
@@ -309,6 +313,7 @@ def _parse_poll(stdout: str) -> RunnerStatus:
     section = ""
     out_lines: list[str] = []
     err_lines: list[str] = []
+    result_lines: list[str] = []
     error = ""
     for line in stdout.splitlines():
         if line.startswith("__SUPER_GPU_STATE__ "):
@@ -329,14 +334,20 @@ def _parse_poll(stdout: str) -> RunnerStatus:
         if line == "__SUPER_GPU_STDERR__":
             section = "stderr"
             continue
+        if line == "__SUPER_GPU_RESULT__":
+            section = "result"
+            continue
         if section == "stdout":
             out_lines.append(line)
         elif section == "stderr":
             err_lines.append(line)
+        elif section == "result":
+            result_lines.append(line)
     return RunnerStatus(
         state=state,
         exit_code=exit_code,
         stdout_tail="\n".join(out_lines)[-12000:],
         stderr_tail="\n".join(err_lines)[-12000:],
         error=error or ("runner process disappeared before writing exit status" if state == "lost" else ""),
+        result_raw="\n".join(result_lines).strip()[:4096],
     )
