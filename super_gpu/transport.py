@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -307,3 +308,81 @@ echo OK
         except (OSError, subprocess.TimeoutExpired) as exc:
             code = 124 if isinstance(exc, subprocess.TimeoutExpired) else 127
             return CommandResult(code, "", str(exc), time.monotonic() - started)
+
+    def download_archive(
+        self,
+        node: NodeConfig,
+        base_dir: str,
+        files: list[str],
+        destination: str | os.PathLike[str],
+        *,
+        timeout: float = 600.0,
+    ) -> CommandResult:
+        """Stream a tar.gz of ``files`` (relative to ``base_dir``) to a local path.
+
+        The file list travels over stdin and the archive over stdout, so the
+        transfer stays binary-safe and needs no temporary file on the remote.
+        """
+        started = time.monotonic()
+        if not files:
+            return CommandResult(1, "", "no files to download", time.monotonic() - started)
+        for name in files:
+            if name.startswith("/") or ".." in Path(name).parts or "\n" in name:
+                return CommandResult(
+                    1, "", f"unsafe archive member: {name!r}", time.monotonic() - started
+                )
+        file_list = ("\n".join(files) + "\n").encode("utf-8")
+        command = (
+            'base="$SUPER_GPU_PULL_BASE"; '
+            'case "$base" in "~") base="$HOME";; "~/"*) base="$HOME/${base#~/}";; esac; '
+            'cd "$base" && tar -czf - -T -'
+        )
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._is_local(node):
+            process_env = os.environ.copy()
+            process_env.update(node.env)
+            process_env["SUPER_GPU_PULL_BASE"] = str(Path(base_dir).expanduser())
+            argv = ["bash", "-c", command]
+        else:
+            assignments = f"SUPER_GPU_PULL_BASE={shlex.quote(base_dir)}"
+            argv = [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ConnectTimeout={max(1, int(self.connect_timeout))}",
+                node.ssh,
+                f"env {assignments} bash -c {shlex.quote(command)}",
+            ]
+            process_env = None
+        try:
+            completed = subprocess.run(
+                argv,
+                input=file_list,
+                capture_output=True,
+                timeout=timeout,
+                env=process_env,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            code = 124 if isinstance(exc, subprocess.TimeoutExpired) else 127
+            return CommandResult(code, "", str(exc), time.monotonic() - started)
+        if completed.returncode != 0:
+            return CommandResult(
+                completed.returncode,
+                "",
+                completed.stderr.decode("utf-8", errors="replace"),
+                time.monotonic() - started,
+            )
+        temporary = destination_path.with_name(
+            f".{destination_path.name}.tmp-{os.getpid()}"
+        )
+        temporary.write_bytes(completed.stdout)
+        temporary.replace(destination_path)
+        return CommandResult(
+            0,
+            f"OK bytes={len(completed.stdout)}\n",
+            completed.stderr.decode("utf-8", errors="replace"),
+            time.monotonic() - started,
+        )

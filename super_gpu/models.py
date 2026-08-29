@@ -341,6 +341,7 @@ class JobSpec:
     max_retries: int = 0
     retry_delay: float = 10.0
     dependencies: list[JobDependency] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], defaults: dict[str, Any] | None = None) -> "JobSpec":
@@ -366,6 +367,7 @@ class JobSpec:
                 JobDependency.from_value(entry)
                 for entry in merged.get("dependencies", [])
             ],
+            outputs=[str(x) for x in merged.get("outputs", [])],
         )
         job.validate()
         return job
@@ -388,6 +390,21 @@ class JobSpec:
             raise ValueError(f"job {self.name!r}: invalid environment keys {invalid_env}")
         for dependency in self.dependencies:
             dependency.validate()
+        for pattern in self.outputs:
+            if not pattern.strip():
+                raise ValueError(f"job {self.name!r}: output patterns must be non-empty")
+            if pattern.startswith("/") or pattern.startswith("~"):
+                raise ValueError(
+                    f"job {self.name!r}: output pattern {pattern!r} must be workspace-relative"
+                )
+            if ".." in pattern.split("/"):
+                raise ValueError(
+                    f"job {self.name!r}: output pattern {pattern!r} must not contain '..'"
+                )
+            if any(ch.isspace() for ch in pattern):
+                raise ValueError(
+                    f"job {self.name!r}: output pattern {pattern!r} must not contain whitespace"
+                )
         self.resources.validate()
 
     def fingerprint(self) -> str:

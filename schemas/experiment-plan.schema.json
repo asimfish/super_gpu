@@ -94,7 +94,16 @@
         "timeout": {"type": "number", "exclusiveMinimum": 0},
         "max_retries": {"type": "integer", "minimum": 0},
         "retry_delay": {"type": "number", "minimum": 0},
-        "dependencies": {"type": "array", "items": {"$ref": "#/$defs/dependency"}}
+        "dependencies": {"type": "array", "items": {"$ref": "#/$defs/dependency"}},
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/|~)(?!.*(^|/)\\.\\.(/|$))\\S+$",
+            "description": "workspace-relative glob; no absolute paths, '..', or whitespace"
+          }
+        }
       }
     },
     "dependency": {

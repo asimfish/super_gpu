@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   pending_reason TEXT NOT NULL DEFAULT '',
   result_state TEXT NOT NULL DEFAULT '',
   result_json TEXT NOT NULL DEFAULT '{}',
+  outputs_json TEXT NOT NULL DEFAULT '[]',
+  run_dir TEXT NOT NULL DEFAULT '',
   UNIQUE(plan_id, name)
 );
 
@@ -146,6 +148,8 @@ JOBS_COLUMN_MIGRATIONS: dict[str, str] = {
     "pending_reason": "TEXT NOT NULL DEFAULT ''",
     "result_state": "TEXT NOT NULL DEFAULT ''",
     "result_json": "TEXT NOT NULL DEFAULT '{}'",
+    "outputs_json": "TEXT NOT NULL DEFAULT '[]'",
+    "run_dir": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -196,6 +200,7 @@ def _plan_payload(plan: ExperimentPlan, plan_id: str) -> dict[str, Any]:
                 "max_retries": job.max_retries,
                 "retry_delay": job.retry_delay,
                 "dependencies": [dep.as_value() for dep in job.dependencies],
+                "outputs": job.outputs,
             }
             for job in plan.jobs
         ],
@@ -263,6 +268,7 @@ class StateStore:
             ("gpus_json", "gpus", []),
             ("handle_json", "handle", {}),
             ("result_json", "result", {}),
+            ("outputs_json", "outputs", []),
         ):
             item[target] = _loads(item.pop(source), fallback)
         item["cancel_requested"] = bool(item["cancel_requested"])
@@ -322,8 +328,9 @@ class StateStore:
                               id, plan_id, name, command, status, priority,
                               nodes_json, labels_json, params_json, env_json,
                               resources_json, dependencies_json, timeout,
-                              max_retries, retry_delay, fingerprint, submitted_at
-                            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              max_retries, retry_delay, fingerprint, submitted_at,
+                              outputs_json
+                            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 job_id,
@@ -350,6 +357,7 @@ class StateStore:
                                 job.retry_delay,
                                 job.fingerprint(),
                                 created,
+                                _json(job.outputs),
                             ),
                         )
                     if plan.request_id:
@@ -651,9 +659,11 @@ class StateStore:
 
     def mark_running(self, job_id: str, handle: dict[str, Any]) -> None:
         with self.connect() as conn:
+            # run_dir survives job completion (handle_json is wiped) so that
+            # declared outputs stay pullable after the job finishes.
             conn.execute(
-                "UPDATE jobs SET status='running', handle_json=?, error='' WHERE id=?",
-                (_json(handle), job_id),
+                "UPDATE jobs SET status='running', handle_json=?, run_dir=?, error='' WHERE id=?",
+                (_json(handle), str(handle.get("run_dir") or ""), job_id),
             )
         self.refresh_plan_for_job(job_id)
 
