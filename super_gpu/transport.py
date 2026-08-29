@@ -215,22 +215,45 @@ class CommandTransport:
             raise ValueError("upload destination or digest is unsafe")
         source_path = Path(source).expanduser().resolve()
         started = time.monotonic()
+
+        def _sha256_of(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest()
+
         if self._is_local(node):
             target = (Path.home() / destination).resolve()
+            if target.is_file() and _sha256_of(target) == expected_sha256:
+                return CommandResult(0, "OK cached\n", "", time.monotonic() - started)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.parent.chmod(0o700)
             temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
             shutil.copyfile(source_path, temporary)
-            digest = hashlib.sha256()
-            with temporary.open("rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            actual = digest.hexdigest()
-            if actual != expected_sha256:
+            if _sha256_of(temporary) != expected_sha256:
                 temporary.unlink(missing_ok=True)
                 return CommandResult(1, "", "uploaded file digest mismatch", time.monotonic() - started)
             temporary.replace(target)
             return CommandResult(0, "OK\n", "", time.monotonic() - started)
+
+        # Probe the content-addressed destination first so a cache hit costs
+        # one short command instead of streaming the whole archive over SSH
+        # only for the remote side to discard it.
+        probe = self.run(
+            node,
+            'if [ -f "$HOME/$SUPER_GPU_UPLOAD_DESTINATION" ] '
+            '&& [ "$(sha256sum "$HOME/$SUPER_GPU_UPLOAD_DESTINATION" | awk \'{print $1}\')" '
+            '= "$SUPER_GPU_UPLOAD_SHA256" ]; then echo __SUPER_GPU_UPLOAD_HIT__; '
+            "else echo __SUPER_GPU_UPLOAD_MISS__; fi",
+            timeout=min(timeout, 60.0),
+            env={
+                "SUPER_GPU_UPLOAD_DESTINATION": destination,
+                "SUPER_GPU_UPLOAD_SHA256": expected_sha256,
+            },
+        )
+        if probe.ok and "__SUPER_GPU_UPLOAD_HIT__" in probe.stdout:
+            return CommandResult(0, "OK cached\n", "", time.monotonic() - started)
 
         remote_script = r'''set -eu
 umask 077

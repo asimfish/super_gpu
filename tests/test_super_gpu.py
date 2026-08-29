@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -31,6 +32,7 @@ from super_gpu.runner import PersistentRunner, RunnerStatus
 from super_gpu.scheduler import Scheduler
 from super_gpu.source_snapshot import SnapshotError, SourceSnapshotStore
 from super_gpu.store import IdempotencyConflict, StateStore
+from super_gpu.transport import CommandTransport
 
 
 def _config(tmp_path, *, nodes=None, default_memory=4096, max_parallel=8):
@@ -700,6 +702,30 @@ def test_source_snapshot_is_deterministic_and_rejects_escaping_symlink(tmp_path)
     (source / "outside").symlink_to(tmp_path / "outside")
     with pytest.raises(SnapshotError, match="escapes source root"):
         snapshots.create(source)
+
+
+def test_upload_file_skips_transfer_when_destination_already_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    node = NodeConfig.from_dict({"name": "local", "ssh": "local", "role": "dedicated"})
+    source = tmp_path / "snapshot.tar.gz"
+    source.write_bytes(b"archive-payload")
+    digest = hashlib.sha256(b"archive-payload").hexdigest()
+    transport = CommandTransport()
+
+    first = transport.upload_file(node, source, "cache/object.tar.gz", expected_sha256=digest)
+    assert first.ok
+    assert "cached" not in first.stdout
+
+    second = transport.upload_file(node, source, "cache/object.tar.gz", expected_sha256=digest)
+    assert second.ok
+    assert "cached" in second.stdout
+
+    (tmp_path / "cache" / "object.tar.gz").write_bytes(b"tampered")
+    third = transport.upload_file(node, source, "cache/object.tar.gz", expected_sha256=digest)
+    assert third.ok
+    assert "cached" not in third.stdout
+    stored = (tmp_path / "cache" / "object.tar.gz").read_bytes()
+    assert stored == b"archive-payload"
 
 
 def test_failed_dependency_propagates_to_downstream_jobs(tmp_path):
