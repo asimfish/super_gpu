@@ -28,6 +28,27 @@ class _GpuCandidate:
     reasons: list[str]
 
 
+@dataclass
+class PlacementDecision:
+    """Outcome of one placement attempt, explainable to agents and humans.
+
+    When ``placement`` is None, ``rejections`` maps every considered node to
+    the concrete rule that excluded it, so a pending job can always answer
+    "why is this not running yet".
+    """
+
+    placement: Placement | None
+    rejections: dict[str, str]
+
+    def summary(self, limit: int = 1000) -> str:
+        if self.placement is not None:
+            return ""
+        if not self.rejections:
+            return "no candidate node produced a decision"
+        text = "; ".join(f"{node}: {reason}" for node, reason in sorted(self.rejections.items()))
+        return text[:limit]
+
+
 class PlacementEngine:
     def __init__(self, config: SystemConfig, monitor: ClusterMonitor) -> None:
         self.config = config
@@ -40,19 +61,42 @@ class PlacementEngine:
         snapshots: list[NodeSnapshot],
         leases: list[dict[str, Any]],
     ) -> Placement | None:
+        return self.decide(job, estimate, snapshots, leases).placement
+
+    def decide(
+        self,
+        job: JobSpec,
+        estimate: ResourceEstimate,
+        snapshots: list[NodeSnapshot],
+        leases: list[dict[str, Any]],
+    ) -> PlacementDecision:
         snapshot_by_node = {snapshot.node: snapshot for snapshot in snapshots}
         leases_by_gpu: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
         for lease in leases:
             leases_by_gpu[(str(lease["node"]), int(lease["gpu_index"]))].append(lease)
 
+        rejections: dict[str, str] = {}
+        candidate_nodes = self._candidate_nodes(job)
+        if not candidate_nodes:
+            rejections["cluster"] = (
+                "no enabled node matches the job's nodes/required_labels constraints"
+            )
         placements: list[Placement] = []
-        for node in self._candidate_nodes(job):
+        for node in candidate_nodes:
             snapshot = snapshot_by_node.get(node.name)
-            if snapshot is None or not snapshot.reachable:
+            if snapshot is None:
+                rejections[node.name] = "no telemetry sample collected yet"
+                continue
+            if not snapshot.reachable:
+                detail = (snapshot.error or "").strip().splitlines()
+                rejections[node.name] = (
+                    f"unreachable: {detail[0][:120]}" if detail else "unreachable"
+                )
                 continue
             gpu_candidates: list[_GpuCandidate] = []
+            gpu_rejections: list[str] = []
             for gpu in snapshot.gpus:
-                candidate = self._evaluate_gpu(
+                candidate, rejection = self._evaluate_gpu(
                     node,
                     gpu,
                     job,
@@ -61,7 +105,17 @@ class PlacementEngine:
                 )
                 if candidate is not None:
                     gpu_candidates.append(candidate)
+                else:
+                    gpu_rejections.append(f"gpu{gpu.index} {rejection}")
             if len(gpu_candidates) < job.resources.gpus:
+                if job.resources.gpus > len(snapshot.gpus):
+                    rejections[node.name] = (
+                        f"job needs {job.resources.gpus} GPUs but node has {len(snapshot.gpus)}"
+                    )
+                else:
+                    rejections[node.name] = "; ".join(gpu_rejections) or (
+                        f"only {len(gpu_candidates)} of {job.resources.gpus} required GPUs eligible"
+                    )
                 continue
             gpu_candidates.sort(key=lambda candidate: candidate.score, reverse=True)
             selected = gpu_candidates[: job.resources.gpus]
@@ -81,9 +135,9 @@ class PlacementEngine:
                 )
             )
         if not placements:
-            return None
+            return PlacementDecision(placement=None, rejections=rejections)
         placements.sort(key=lambda placement: placement.score, reverse=True)
-        return placements[0]
+        return PlacementDecision(placement=placements[0], rejections=rejections)
 
     def _candidate_nodes(self, job: JobSpec) -> list[NodeConfig]:
         allowed = set(job.nodes)
@@ -106,7 +160,7 @@ class PlacementEngine:
         job: JobSpec,
         estimate: ResourceEstimate,
         active_leases: list[dict[str, Any]],
-    ) -> _GpuCandidate | None:
+    ) -> tuple[_GpuCandidate | None, str]:
         policy = node.policy
         active_jobs = len(active_leases)
         reserved_mib = sum(int(lease["memory_mib"]) for lease in active_leases)
@@ -116,11 +170,13 @@ class PlacementEngine:
             else policy.allow_colocation
         )
         if active_jobs and not allow_colocation:
-            return None
+            return None, f"holds {active_jobs} lease(s) and colocation is disabled"
         if active_jobs >= policy.max_jobs_per_gpu:
-            return None
+            return None, f"at max_jobs_per_gpu ({active_jobs}/{policy.max_jobs_per_gpu})"
         if gpu.utilization >= policy.max_gpu_utilization:
-            return None
+            return None, (
+                f"utilization {gpu.utilization}% >= limit {policy.max_gpu_utilization}%"
+            )
 
         # Current memory already includes workloads that have ramped up while
         # reservations cover workloads that have not. max() avoids counting
@@ -132,12 +188,17 @@ class PlacementEngine:
             - policy.reserve_memory_mib
         )
         if available_mib < estimate.memory_mib:
-            return None
+            return None, (
+                f"free memory {max(0, available_mib)}MiB < required {estimate.memory_mib}MiB"
+            )
         predicted_ratio = (
             committed_mib + estimate.memory_mib + policy.reserve_memory_mib
         ) / max(1, gpu.memory_total_mib)
         if predicted_ratio > policy.max_memory_used_ratio:
-            return None
+            return None, (
+                f"predicted memory ratio {predicted_ratio:.2f} > "
+                f"limit {policy.max_memory_used_ratio:.2f}"
+            )
 
         if node.role == "shared":
             # Shared nodes must remain quiet for multiple consecutive samples.
@@ -155,13 +216,17 @@ class PlacementEngine:
                 policy.stabilization_samples,
                 quiet,
             ):
-                return None
+                return None, (
+                    f"waiting for {policy.stabilization_samples} consecutive quiet samples"
+                )
             if (
                 policy.cooldown_seconds > 0
                 and self.monitor.seconds_since_pressure(node.name, gpu.index)
                 < policy.cooldown_seconds
             ):
-                return None
+                return None, (
+                    f"in post-pressure cooldown ({policy.cooldown_seconds:g}s)"
+                )
 
         role_boost = 10000 if node.role == "dedicated" else 0
         priority_score = node.priority * 100
@@ -189,12 +254,15 @@ class PlacementEngine:
             f"util={gpu.utilization}%",
             f"active_jobs={active_jobs}",
         ]
-        return _GpuCandidate(
-            node=node,
-            gpu=gpu,
-            available_mib=available_mib,
-            active_jobs=active_jobs,
-            reserved_mib=reserved_mib,
-            score=score,
-            reasons=reasons,
+        return (
+            _GpuCandidate(
+                node=node,
+                gpu=gpu,
+                available_mib=available_mib,
+                active_jobs=active_jobs,
+                reserved_mib=reserved_mib,
+                score=score,
+                reasons=reasons,
+            ),
+            "",
         )
