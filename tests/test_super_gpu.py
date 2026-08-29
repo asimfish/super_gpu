@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -613,6 +614,119 @@ def test_dedicated_node_is_preferred_and_shared_pressure_blocks(tmp_path):
         }
     )
     assert engine.choose(shared_job, estimate, [busy_shared], []) is None
+
+
+def test_store_migrates_legacy_database_without_new_columns(tmp_path):
+    from super_gpu.store import JOBS_COLUMN_MIGRATIONS
+
+    path = tmp_path / "state.sqlite3"
+    StateStore(path)
+    conn = sqlite3.connect(path)
+    for column in JOBS_COLUMN_MIGRATIONS:
+        conn.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+    conn.commit()
+    conn.close()
+
+    store = StateStore(path)
+    store.submit_plan(
+        ExperimentPlan.from_dict(
+            {"name": "legacy", "jobs": [{"name": "job", "command": "echo ok"}]}
+        )
+    )
+    job = store.list_jobs()[0]
+    assert job["pending_reason"] == ""
+
+
+def test_placement_decide_explains_each_node(tmp_path):
+    config = _config(
+        tmp_path,
+        nodes=[
+            {
+                "name": "busy",
+                "ssh": "local",
+                "role": "dedicated",
+                "workspace": str(tmp_path),
+                "policy": {"max_gpu_utilization": 50},
+            },
+            {
+                "name": "offline",
+                "ssh": "local",
+                "role": "dedicated",
+                "workspace": str(tmp_path),
+            },
+        ],
+    )
+    engine = PlacementEngine(config, ClusterMonitor(config))
+    estimate = ResourceEstimate(2048, 30, None, "plan", 1.0)
+    job = JobSpec.from_dict(
+        {"name": "j", "command": "echo ok", "resources": {"memory_mib": 2048}}
+    )
+    busy = _snapshot("busy", util=80)
+    offline = _snapshot("offline")
+    offline.reachable = False
+    offline.error = "ssh: connect timeout"
+
+    decision = engine.decide(job, estimate, [busy, offline], [])
+    assert decision.placement is None
+    assert "utilization 80% >= limit 50%" in decision.rejections["busy"]
+    assert decision.rejections["offline"].startswith("unreachable")
+    summary = decision.summary()
+    assert "busy:" in summary and "offline:" in summary
+
+    hungry = JobSpec.from_dict(
+        {"name": "hungry", "command": "echo ok", "resources": {"memory_mib": 999999}}
+    )
+    decision = engine.decide(hungry, estimate=ResourceEstimate(999999, 30, None, "plan", 1.0),
+                             snapshots=[_snapshot("busy", util=0)], leases=[])
+    assert "free memory" in decision.rejections["busy"]
+    assert "< required 999999MiB" in decision.rejections["busy"]
+
+    wide = JobSpec.from_dict(
+        {"name": "wide", "command": "echo ok", "resources": {"gpus": 2}}
+    )
+    decision = engine.decide(wide, estimate, [_snapshot("busy", util=0)], [])
+    assert decision.rejections["busy"] == "job needs 2 GPUs but node has 1"
+
+    picky = JobSpec.from_dict(
+        {"name": "picky", "command": "echo ok", "required_labels": ["nvlink"]}
+    )
+    decision = engine.decide(picky, estimate, [busy], [])
+    assert "required_labels" in decision.rejections["cluster"]
+
+    placed = engine.decide(job, estimate, [_snapshot("busy", util=0)], [])
+    assert placed.placement is not None
+    assert placed.summary() == ""
+
+
+def test_scheduler_records_pending_reason_and_clears_after_placement(tmp_path):
+    config = _config(tmp_path)
+    store = StateStore(config.database)
+    monitor = FakeMonitor([_snapshot(util=99)])
+    scheduler = Scheduler(config, store=store, monitor=monitor, runner=FakeRunner())
+    submitted = scheduler.submit(
+        ExperimentPlan.from_dict(
+            {
+                "name": "explain",
+                "jobs": [
+                    {"name": "train", "command": "echo train"},
+                    {"name": "eval", "command": "echo eval", "dependencies": ["train"]},
+                ],
+            }
+        )
+    )
+    scheduler.run_once()
+    jobs = {job["name"]: job for job in store.list_jobs(plan_id=submitted["id"])}
+    assert jobs["train"]["status"] == "pending"
+    assert "gpu-main" in jobs["train"]["pending_reason"]
+    assert "utilization 99%" in jobs["train"]["pending_reason"]
+    assert "waiting for dependencies: train" in jobs["eval"]["pending_reason"]
+
+    monitor.snapshots = [_snapshot(util=0)]
+    scheduler.run_once()
+    jobs = {job["name"]: job for job in store.list_jobs(plan_id=submitted["id"])}
+    assert jobs["train"]["status"] == "running"
+    assert jobs["train"]["pending_reason"] == ""
+    store.release_controller(scheduler.owner)
 
 
 def test_estimator_learns_from_history(tmp_path):

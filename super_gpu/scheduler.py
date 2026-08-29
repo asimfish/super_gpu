@@ -386,20 +386,29 @@ class Scheduler:
 
     def _schedule_pending(self, snapshots: list[NodeSnapshot]) -> None:
         global_slots = self.config.max_parallel - self.store.active_count()
-        if global_slots <= 0:
-            return
         leases = self.store.leases(active_only=True)
-        for row in self.store.runnable_jobs():
+        rows = self.store.runnable_jobs(annotate=True)
+        for index, row in enumerate(rows):
             if global_slots <= 0:
+                for waiting in rows[index:]:
+                    self.store.set_pending_reason(
+                        waiting["id"],
+                        f"cluster max_parallel ({self.config.max_parallel}) reached",
+                    )
                 break
             plan = self.store.get_plan(row["plan_id"])
             plan_limit = plan.get("max_parallel")
             if plan_limit is not None and self.store.active_count(row["plan_id"]) >= int(plan_limit):
+                self.store.set_pending_reason(
+                    row["id"], f"plan max_parallel ({int(plan_limit)}) reached"
+                )
                 continue
             job = self._spec_from_row(row)
             estimate = self.estimator.estimate(job)
-            placement = self.placement.choose(job, estimate, snapshots, leases)
+            decision = self.placement.decide(job, estimate, snapshots, leases)
+            placement = decision.placement
             if placement is None:
+                self.store.set_pending_reason(row["id"], decision.summary())
                 continue
             if not self.store.acquire_placement(row["id"], placement, self.config.lease_ttl):
                 continue

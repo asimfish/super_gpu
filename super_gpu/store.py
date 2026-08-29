@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   stdout_tail TEXT NOT NULL DEFAULT '',
   stderr_tail TEXT NOT NULL DEFAULT '',
   cancel_requested INTEGER NOT NULL DEFAULT 0,
+  pending_reason TEXT NOT NULL DEFAULT '',
   UNIQUE(plan_id, name)
 );
 
@@ -133,6 +134,13 @@ CREATE TABLE IF NOT EXISTS watchdog_observations (
   samples INTEGER NOT NULL
 );
 """
+
+# Columns added after the first release; applied to databases created by
+# older versions. SQLite CREATE TABLE IF NOT EXISTS never alters existing
+# tables, so each new jobs column needs an entry here as well.
+JOBS_COLUMN_MIGRATIONS: dict[str, str] = {
+    "pending_reason": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 def _json(value: Any) -> str:
@@ -225,6 +233,13 @@ class StateStore:
         with self._init_lock:
             with self.connect() as conn:
                 conn.executescript(SCHEMA)
+                existing = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+                }
+                for column, ddl in JOBS_COLUMN_MIGRATIONS.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
 
     @staticmethod
     def _job_row(row: sqlite3.Row | None) -> dict[str, Any]:
@@ -409,7 +424,18 @@ class StateStore:
         with self.connect() as conn:
             return [self._job_row(row) for row in conn.execute(sql, args).fetchall()]
 
-    def runnable_jobs(self, now: float | None = None) -> list[dict[str, Any]]:
+    def runnable_jobs(
+        self,
+        now: float | None = None,
+        *,
+        annotate: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return pending jobs whose gates are open.
+
+        With ``annotate=True`` (used by the scheduler tick) jobs held back by
+        retry backoff or dependencies get a human-readable ``pending_reason``
+        so agents can see why a job is not running yet.
+        """
         timestamp = now if now is not None else now_ts()
         pending = self.list_jobs(statuses=["pending"], limit=10000)
         if not pending:
@@ -426,12 +452,45 @@ class StateStore:
                 }
         runnable = []
         for job in pending:
-            if job["next_run_at"] > timestamp or job["cancel_requested"]:
+            if job["cancel_requested"]:
+                continue
+            if job["next_run_at"] > timestamp:
+                if annotate:
+                    self.set_pending_reason(
+                        job["id"],
+                        f"in retry backoff after attempt {job['attempt']}",
+                    )
                 continue
             statuses = plan_jobs.get(job["plan_id"], {})
-            if all(statuses.get(dep) == "completed" for dep in job["dependencies"]):
-                runnable.append(job)
+            unmet = [
+                dependency
+                for dependency in job["dependencies"]
+                if statuses.get(dependency) != "completed"
+            ]
+            if unmet:
+                if annotate:
+                    detail = ", ".join(
+                        f"{dependency} ({statuses.get(dependency, 'missing')})"
+                        for dependency in unmet[:5]
+                    )
+                    self.set_pending_reason(
+                        job["id"], f"waiting for dependencies: {detail}"
+                    )
+                continue
+            runnable.append(job)
         return runnable
+
+    def set_pending_reason(self, job_id: str, reason: str) -> None:
+        """Record why a pending job is not running; writes only on change."""
+        normalized = (reason or "")[:1000]
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET pending_reason=?
+                WHERE id=? AND status='pending' AND pending_reason<>?
+                """,
+                (normalized, job_id, normalized),
+            )
 
     def fail_blocked_dependencies(self) -> list[dict[str, Any]]:
         """Fail pending jobs whose upstream dependency cannot complete.
@@ -524,7 +583,8 @@ class StateStore:
                     """
                     UPDATE jobs
                     SET status='starting', node=?, gpus_json=?, estimate_json=?,
-                        attempt=attempt+1, started_at=COALESCE(started_at, ?), error=''
+                        attempt=attempt+1, started_at=COALESCE(started_at, ?), error='',
+                        pending_reason=''
                     WHERE id=?
                     """,
                     (
@@ -672,19 +732,26 @@ class StateStore:
                 status = "cancelled"
                 next_run_at = 0.0
                 finished_at: float | None = timestamp
+                pending_reason = ""
             elif int(row["attempt"]) <= int(row["max_retries"]):
                 status = "pending"
                 next_run_at = timestamp + float(row["retry_delay"])
                 finished_at = None
+                pending_reason = (
+                    f"retry scheduled in {float(row['retry_delay']):g}s "
+                    f"(attempt {int(row['attempt'])} of {int(row['max_retries']) + 1} failed)"
+                )
             else:
                 status = "failed"
                 next_run_at = 0.0
                 finished_at = timestamp
+                pending_reason = ""
             conn.execute(
                 """
                 UPDATE jobs
                 SET status=?, exit_code=?, error=?, stdout_tail=?, stderr_tail=?,
-                    finished_at=?, next_run_at=?, handle_json='{}', node='', gpus_json='[]'
+                    finished_at=?, next_run_at=?, handle_json='{}', node='', gpus_json='[]',
+                    pending_reason=?
                 WHERE id=?
                 """,
                 (
@@ -695,6 +762,7 @@ class StateStore:
                     stderr_tail[-12000:],
                     finished_at,
                     next_run_at,
+                    pending_reason,
                     job_id,
                 ),
             )

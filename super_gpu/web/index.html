@@ -989,7 +989,12 @@
       }
       $("jobs").innerHTML = jobs.slice(0, 200).map((job) => {
         const estimate = job.estimate || {};
-        const placement = job.node ? `${esc(job.node)} / ${(job.gpus || []).map((gpu) => `GPU ${gpu}`).join(", ")}` : "等待调度";
+        const waiting = job.status === "pending" && job.pending_reason
+          ? `<br><span style="color:#8a93a6;font-size:9px" title="${esc(job.pending_reason)}">${esc(job.pending_reason.slice(0, 120))}</span>`
+          : "";
+        const placement = job.node
+          ? `${esc(job.node)} / ${(job.gpus || []).map((gpu) => `GPU ${gpu}`).join(", ")}`
+          : `等待调度${waiting}`;
         const canCancel = ["pending", "starting", "running"].includes(job.status);
         return `<tr>
           <td class="name" title="${esc(job.id)}">${esc(job.name)}<br><span style="color:#667489;font-size:9px">${esc(job.plan_id)}</span></td>
