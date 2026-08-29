@@ -51,9 +51,22 @@ server list and experiment plan, and it can run the whole campaign.
 - **Reliable execution**: remote commands run under a persistent runner with
   durable PID, log, and exit-code files, so a controller restart can resume
   supervision of every job.
+- **Explainable scheduling**: every pending job carries a live
+  `pending_reason` — which rule excluded each node, which limit was reached,
+  or which dependency it is waiting for — visible in the dashboard, API, and
+  CLI, so "why is this not running yet" never needs guesswork.
+- **Typed results, not just exit codes**: a job may write a JSON verdict
+  (for example `scientific_reject`) to `$SUPER_GPU_RESULT_FILE`; dependency
+  predicates such as `{"job": "probe", "after": "result", "result_states":
+  [...]}` route downstream jobs on those verdicts, and unsatisfiable branches
+  are skipped rather than failed.
+- **Declared outputs**: jobs list workspace-relative globs under `outputs`;
+  after the job finishes, `super-gpu pull <job-id>` expands them on the node
+  that ran the job and streams one archive back — no manual scp archaeology.
 - **Immutable source snapshots**: submission builds a deterministic,
   SHA-256 content-addressed archive of your source tree; remote hosts verify
-  the digest before unpacking a private copy per job.
+  the digest before unpacking a private copy per job, and an upload is
+  skipped entirely when the node already holds the same digest.
 - **Idempotent submission**: a stable `request_id` and an intent digest are
   committed in one transaction. Retrying a timed-out submit returns the
   original plan; the same ID with different content returns HTTP 409.
@@ -262,8 +275,64 @@ SUPER_GPU_PARAM_<PARAM_NAME>
 PYTHONUNBUFFERED=1
 ```
 
-`dependencies` refer to job names within the same plan; a downstream job
-becomes schedulable only after its dependencies complete.
+`dependencies` refer to job names within the same plan. The plain string form
+(`"dependencies": ["baseline"]`) schedules a job after the named dependency
+*succeeds*. The object form adds routing on typed results:
+
+```json
+{
+  "name": "scale-up",
+  "command": "python3 train.py --big",
+  "dependencies": [
+    {"job": "probe", "after": "result", "result_states": ["success"]}
+  ]
+}
+```
+
+- `after: "success"` (default) — run only if the dependency succeeded.
+- `after: "complete"` — run once the dependency is terminal, regardless of
+  outcome.
+- `after: "result"` — run only if the dependency's result state is in
+  `result_states`.
+
+A job reports its result by writing JSON to the path in
+`$SUPER_GPU_RESULT_FILE` before exiting 0:
+
+```json
+{"state": "scientific_reject", "metrics": {"val_acc": 0.51}}
+```
+
+Accepted states are `success` and `scientific_reject`; anything else is
+recorded as metadata but the state falls back to `success`. Infrastructure
+failures (`infra_failure`), non-zero exits (`execution_failure`), and
+cancellations are assigned by the scheduler itself. Jobs whose dependency
+predicate can never be satisfied are marked `skipped` with result state
+`dependency_skipped` instead of `failed`, and the skip cascades downstream.
+
+### Declared Outputs
+
+Jobs may declare the artifacts they produce as workspace-relative glob
+patterns (no absolute paths, `..`, or whitespace):
+
+```json
+{
+  "name": "train",
+  "command": "python3 train.py",
+  "outputs": ["results/*.json", "checkpoints/**/*.pt", "logs"]
+}
+```
+
+Once the job is terminal, collect them from the controller host:
+
+```bash
+.venv/bin/super-gpu pull <job-id> --dest ./outputs
+# files land in ./outputs/<job-name>/, preserving relative paths
+```
+
+`GET /api/jobs/<id>/outputs` (and the MCP tool `experiment_outputs`) expands
+the patterns on the node without transferring bytes, so an agent can inspect
+what exists before pulling. A directory pattern collects every file beneath
+it; patterns that match nothing simply return an empty list.
 
 ### Snapshot and Idempotency Semantics
 
@@ -314,6 +383,7 @@ Exposed tools:
 | `experiment_submit` | idempotent plan submission with `request_id` |
 | `experiment_status` | one plan with all of its jobs |
 | `experiment_jobs` | filterable job listing |
+| `experiment_outputs` | expand a finished job's declared outputs on its node |
 | `experiment_cancel` | cancel a single job |
 | `scheduler_events` | recent scheduling decisions and transitions |
 | `anomaly_report` | idle-yet-occupied GPU findings and watchdog policy |
@@ -368,7 +438,8 @@ as idleness. Treat `cancel_managed` as destructive authority — see
 | GET | `/api/plans` | list plans |
 | GET | `/api/plans/<id>` | one plan with all jobs |
 | POST | `/api/plans` | submit a plan JSON; supports top-level `request_id`, conflict → 409 |
-| GET | `/api/jobs` | query jobs |
+| GET | `/api/jobs` | query jobs (each job carries `pending_reason` and `result_state`) |
+| GET | `/api/jobs/<id>/outputs` | expand a finished job's declared outputs on its node |
 | POST | `/api/jobs/<id>/cancel` | cancel a job |
 | POST | `/api/scan` | refresh GPU state immediately |
 | GET | `/api/events` | scheduler events |

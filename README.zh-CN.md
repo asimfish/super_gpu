@@ -35,7 +35,10 @@
 - **持续补位**：调度器每隔数秒重采集集群状态，任何 GPU 稳定释放后立即从 pending 队列挑选合适实验。
 - **会学习的资源估算**：首轮使用计划声明或保守启发值；完成后记录实际峰值显存与运行时长，后续相同任务自动采用历史估算。OOM 会自动提高下一次显存预算。
 - **可靠运行**：远端命令通过持久 runner 执行，PID、日志和退出码文件持久化；控制器重启后可以完整恢复对每个任务的监管。
-- **不可变实验快照**：提交时生成确定性源码归档，以 SHA-256 内容寻址；远端校验 digest 后再为每个 job 解包独立副本。
+- **可解释调度**：每个 pending 任务实时携带 `pending_reason`——哪条规则排除了哪个节点、触到了哪个并行上限、在等哪个依赖——Dashboard、API、CLI 都能看到，"为什么还没跑"不用猜。
+- **类型化结果，不止退出码**：任务可在退出前把 JSON 判定（如 `scientific_reject`）写入 `$SUPER_GPU_RESULT_FILE`；依赖谓词（`after: "result"` + `result_states`）按判定路由下游任务，无法满足的分支标记为 `skipped` 而非 `failed`。
+- **声明式产物**：任务用 `outputs` 声明工作目录相对的 glob 清单；结束后 `super-gpu pull <job-id>` 在运行节点展开并一次归档拉回，不再手工 scp 考古。
+- **不可变实验快照**：提交时生成确定性源码归档，以 SHA-256 内容寻址；远端校验 digest 后再为每个 job 解包独立副本，节点上已有同 digest 时直接跳过传输。
 - **幂等提交**：稳定 `request_id` 与实验意图摘要同事务落库；超时重试返回原计划，相同 ID 配不同内容返回 HTTP 409。
 - **强任务身份**：runner 同时校验 launch token、PID 与 Linux 进程启动时钟，拒绝向 PID 复用后的无关进程发信号。
 - **Agent 优先接口**：同时提供 CLI、REST 和 MCP；仓库内置 [`AGENTS.md`](AGENTS.md) 操作契约与实验计划 [JSON Schema](schemas/experiment-plan.schema.json)。
@@ -215,7 +218,56 @@ SUPER_GPU_PARAM_<PARAM_NAME>
 PYTHONUNBUFFERED=1
 ```
 
-`dependencies` 使用同一 plan 内的 job name。依赖完成后，下游任务才会进入可调度状态。
+`dependencies` 使用同一 plan 内的 job name。字符串形式（`"dependencies":
+["baseline"]`）表示依赖*成功*后调度；对象形式支持按类型化结果路由：
+
+```json
+{
+  "name": "scale-up",
+  "command": "python3 train.py --big",
+  "dependencies": [
+    {"job": "probe", "after": "result", "result_states": ["success"]}
+  ]
+}
+```
+
+- `after: "success"`（默认）——依赖成功才运行。
+- `after: "complete"`——依赖到达终态即运行，无论结局。
+- `after: "result"`——依赖的结果状态命中 `result_states` 才运行。
+
+任务在以 0 退出前，把 JSON 判定写入 `$SUPER_GPU_RESULT_FILE` 即可上报结果：
+
+```json
+{"state": "scientific_reject", "metrics": {"val_acc": 0.51}}
+```
+
+应用可上报的状态只有 `success` 和 `scientific_reject`（白名单），其余内容作为
+元数据记录、状态回退为 `success`。`infra_failure`、`execution_failure`、
+`cancelled` 由调度器自行判定。依赖谓词永远无法满足的任务会被标记为
+`skipped`（结果状态 `dependency_skipped`）而非 `failed`，并级联到更下游。
+
+### 声明式产物
+
+任务可以用工作目录相对的 glob 声明自己的产物（禁止绝对路径、`..` 和空白字符）：
+
+```json
+{
+  "name": "train",
+  "command": "python3 train.py",
+  "outputs": ["results/*.json", "checkpoints/**/*.pt", "logs"]
+}
+```
+
+任务进入终态后，在 controller 主机一键回收：
+
+```bash
+.venv/bin/super-gpu pull <job-id> --dest ./outputs
+# 文件落在 ./outputs/<job-name>/ 下，保持相对路径
+```
+
+`GET /api/jobs/<id>/outputs`（及 MCP 工具 `experiment_outputs`）只在节点上展开
+清单、不传输字节，Agent 可以先看有什么再决定拉取。目录模式会递归收集其下全部
+文件；没有匹配时返回空清单。
 
 ### 快照与幂等语义
 
@@ -254,6 +306,7 @@ SUPER_GPU_URL=http://127.0.0.1:8765 \
 | `experiment_submit` | 带 `request_id` 的幂等计划提交 |
 | `experiment_status` | 单个计划及其全部 jobs |
 | `experiment_jobs` | 可过滤的任务列表 |
+| `experiment_outputs` | 在运行节点上展开已完成任务的声明产物清单 |
 | `experiment_cancel` | 取消单个任务 |
 | `scheduler_events` | 最近的调度决策与状态迁移 |
 | `anomaly_report` | 低利用率占卡发现与 watchdog 策略 |
@@ -297,7 +350,8 @@ export SUPER_GPU_WATCHDOG_ACTION=cancel_managed
 | GET | `/api/plans` | 计划列表 |
 | GET | `/api/plans/<id>` | 计划和所有 jobs |
 | POST | `/api/plans` | 提交计划 JSON；支持顶层 `request_id`，冲突返回 409 |
-| GET | `/api/jobs` | 查询 jobs |
+| GET | `/api/jobs` | 查询 jobs（每条含 `pending_reason` 与 `result_state`） |
+| GET | `/api/jobs/<id>/outputs` | 在运行节点上展开已完成任务的声明产物清单 |
 | POST | `/api/jobs/<id>/cancel` | 取消任务 |
 | POST | `/api/scan` | 立即刷新 GPU 状态 |
 | GET | `/api/events` | 调度事件 |
