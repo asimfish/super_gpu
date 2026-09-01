@@ -10,9 +10,15 @@
 
 `super_gpu` 持续采集每张卡的显存、GPU 利用率、温度、功耗和进程信息，按照服务器角色与任务资源需求自动放置实验，并全程监管——自动续租、失败重试、在 GPU 释放后立即回填新任务。它天生为交给 AI Agent 使用而设计：把仓库链接、服务器列表和实验计划交给 Agent，它就能跑完整个实验批次。
 
+![super_gpu Dashboard——实时集群视图](docs/assets/dashboard-fleet.png)
+
+<sub>无需任何 GPU 服务器即可复现上图：`python3 scripts/demo_dashboard.py`
+会构造一个三节点模拟集群并在其上运行真实 Dashboard，见[先试玩](#先试玩无需-gpu)。</sub>
+
 ## 目录
 
 - [核心特性](#核心特性)
+- [为什么选 super_gpu](#为什么选-super_gpu)
 - [直接交给 Agent](#直接交给-agent)
 - [架构](#架构)
 - [快速开始](#快速开始)
@@ -24,6 +30,7 @@
 - [REST API](#rest-api)
 - [安全](#安全)
 - [当前边界](#当前边界)
+- [路线图](#路线图)
 - [文档](#文档)
 - [开发](#开发)
 - [许可证](#许可证)
@@ -43,6 +50,17 @@
 - **强任务身份**：runner 同时校验 launch token、PID 与 Linux 进程启动时钟，拒绝向 PID 复用后的无关进程发信号。
 - **Agent 优先接口**：同时提供 CLI、REST 和 MCP；仓库内置 [`AGENTS.md`](AGENTS.md) 操作契约与实验计划 [JSON Schema](schemas/experiment-plan.schema.json)。
 - **实时前端**：无外部 CDN 依赖的 Dashboard，实时展示全部服务器、GPU、租约、实验队列与调度事件。
+
+## 为什么选 super_gpu
+
+| 替代方案 | 典型场景 | super_gpu 的差异 |
+|---|---|---|
+| Slurm / K8s + Kueue | 有管理员权限的大型托管集群 | 零集群基础设施：任何能 SSH 的机器几分钟内变成节点，包括你没有管理权限的共享实验室机器 |
+| Ray 等分布式框架 | 代码按框架 API 编写 | 任务就是普通 shell 命令——不用 import 任何东西，节点上没有常驻 daemon |
+| gpustat / nvitop 类监控 | 人眼盯卡 | 同样的遥测直接喂给真正的调度器：放置、监管、重试、回填 |
+| 手工 tmux + `CUDA_VISIBLE_DEVICES` | 单机、少量实验 | 会学习的资源估算、共享机礼仪、幂等提交、类型化结果、产物回收 |
+
+设计目标是填补「实验室有 Slurm」和「我只有几台能 SSH 的机器，其中一些是共享的」之间的空档：把专用机器压满、绝不打扰共享机器上别人的任务，并且全程可由 AI Agent 操作。
 
 ## 直接交给 Agent
 
@@ -96,6 +114,18 @@ Experiment plan / Agent / Dashboard
 组件边界与失败模型见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，快照、幂等与 watchdog 背后的设计决策见 [docs/adr/](docs/adr)。
 
 ## 快速开始
+
+### 先试玩（无需 GPU）
+
+```bash
+git clone https://github.com/asimfish/super_gpu.git
+cd super_gpu
+python3 scripts/demo_dashboard.py
+```
+
+这会构造一个三节点模拟集群（两台专用、一台被其他用户占用的共享机），把一个小型消融计划跑过真实调度器，然后在 <http://127.0.0.1:8899> 提供 Dashboard——已完成、运行中、排队中的任务齐全，每个排队任务都带实时 `pending_reason`。本 README 的全部截图都出自这条命令。
+
+### 真实集群
 
 要求：控制机 Python 3.10+；目标服务器为 NVIDIA GPU，安装 `nvidia-smi`，并可通过 `~/.ssh/config` 中的别名免交互连接。
 
@@ -246,6 +276,8 @@ PYTHONUNBUFFERED=1
 `cancelled` 由调度器自行判定。依赖谓词永远无法满足的任务会被标记为
 `skipped`（结果状态 `dependency_skipped`）而非 `failed`，并级联到更下游。
 
+![实验队列：实时 pending 原因与调度事件](docs/assets/dashboard-queue.png)
+
 ### 声明式产物
 
 任务可以用工作目录相对的 glob 声明自己的产物（禁止绝对路径、`..` 和空白字符）：
@@ -377,6 +409,18 @@ super-gpu --config config.json serve --host 0.0.0.0
 - 新任务使用 token + `/proc` start ticks 验证进程身份；升级前仍在运行的旧 handle 以 PID-only 兼容模式监管到结束。
 - 真实多服务器 SSH/GPU 端到端验证需要实际服务器凭据，在 CI 之外进行。
 
+## 路线图
+
+按大致优先级排列的规划方向——欢迎 issue 和 PR：
+
+- **容器化端到端测试**：docker-compose 模拟节点 + mock `nvidia-smi`，让 SSH runner 和调度器在 CI 里跑通完整链路。
+- **发布到 PyPI**：`pip install super-gpu`、语义化版本、变更日志。
+- **按进程归因利用率**：接入 NVML accounting，让共享机准入能区分受管任务与他人负载。
+- **完成通知**：任务/计划进入终态时推送 webhook（Slack、飞书、通用 HTTP）。
+- **Prometheus `/metrics`**：一等公民的集群与队列指标抓取端点。
+- **AMD ROCm 后端**：在 NVIDIA 之外支持 `rocm-smi` 监控。
+- **跨计划优先级与抢占**：允许紧急计划抢占它有权置换的低优先级受管任务。
+
 ## 文档
 
 | 文档 | 内容 |
@@ -395,7 +439,7 @@ python3 -m pip install -e ".[dev]"
 python3 -m pytest
 ```
 
-CI 会在 Python 3.10、3.11、3.12 上对每次 push 和 pull request 运行测试。欢迎提交 issue 和 PR——请尽量附带失败测试或复现步骤，并在提交前跑通测试套件。
+CI 会在 Python 3.10、3.11、3.12 上对每次 push 和 pull request 运行测试。欢迎提交 issue 和 PR——环境搭建、约定与提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 

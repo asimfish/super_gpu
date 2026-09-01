@@ -16,9 +16,16 @@ backfilling freed GPUs without human intervention. It is designed to be handed
 directly to an AI agent: point the agent at this repository, give it your
 server list and experiment plan, and it can run the whole campaign.
 
+![super_gpu dashboard — live fleet view](docs/assets/dashboard-fleet.png)
+
+<sub>Reproducible without any GPU server: `python3 scripts/demo_dashboard.py`
+seeds a simulated three-node cluster and serves the real dashboard on top of
+it. See [Try It First](#try-it-first-no-gpus-required).</sub>
+
 ## Table of Contents
 
 - [Highlights](#highlights)
+- [Why super_gpu?](#why-super_gpu)
 - [Hand It to an Agent](#hand-it-to-an-agent)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
@@ -30,6 +37,7 @@ server list and experiment plan, and it can run the whole campaign.
 - [REST API](#rest-api)
 - [Security](#security)
 - [Current Limitations](#current-limitations)
+- [Roadmap](#roadmap)
 - [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
@@ -78,6 +86,20 @@ server list and experiment plan, and it can run the whole campaign.
   [JSON Schema](schemas/experiment-plan.schema.json) for plans.
 - **Live dashboard**: a zero-CDN web UI showing every server, GPU, lease, job
   queue, and scheduler event in real time.
+
+## Why super_gpu?
+
+| Alternative | Typical fit | Where super_gpu differs |
+|---|---|---|
+| Slurm / K8s + Kueue | large managed clusters you administer | zero cluster infrastructure: any box you can SSH into becomes a node in minutes, including shared lab machines you do *not* administer |
+| Ray and similar frameworks | code written against the framework API | jobs stay plain shell commands — nothing to import, no daemon on the nodes |
+| gpustat / nvitop-style monitors | watching GPUs by eye | the same telemetry feeds an actual scheduler that places, supervises, retries, and backfills |
+| tmux + `CUDA_VISIBLE_DEVICES` by hand | one machine, a handful of runs | learned resource estimation, shared-node etiquette, idempotent submission, typed results, output collection |
+
+The design target is the gap between "my lab runs Slurm" and "I have SSH
+access to a few machines, some of them shared": pack your dedicated machines
+aggressively, never disturb other people's work on shared ones, and stay
+operable end to end by an AI agent.
 
 ## Hand It to an Agent
 
@@ -144,6 +166,22 @@ the failure model, and [docs/adr/](docs/adr) for the design decisions behind
 snapshotting, idempotency, and the watchdog.
 
 ## Quick Start
+
+### Try It First (no GPUs required)
+
+```bash
+git clone https://github.com/asimfish/super_gpu.git
+cd super_gpu
+python3 scripts/demo_dashboard.py
+```
+
+This seeds a simulated three-node fleet (two dedicated, one shared with other
+users' workloads), runs a small ablation plan through the real scheduler, and
+serves the dashboard at <http://127.0.0.1:8899> — completed, running, and
+pending jobs included, each pending job carrying its live `pending_reason`.
+Every screenshot in this README comes from that command.
+
+### Real Cluster
 
 Requirements: Python 3.10+ on the controller host; NVIDIA GPUs with
 `nvidia-smi` on the target servers, reachable non-interactively through
@@ -308,6 +346,8 @@ failures (`infra_failure`), non-zero exits (`execution_failure`), and
 cancellations are assigned by the scheduler itself. Jobs whose dependency
 predicate can never be satisfied are marked `skipped` with result state
 `dependency_skipped` instead of `failed`, and the skip cascades downstream.
+
+![Experiment queue with live pending reasons and scheduler events](docs/assets/dashboard-queue.png)
 
 ### Declared Outputs
 
@@ -475,6 +515,23 @@ including how to report a vulnerability: [SECURITY.md](SECURITY.md).
 - Real multi-server SSH/GPU end-to-end validation requires live server
   credentials and is exercised outside CI.
 
+## Roadmap
+
+Planned directions, roughly in priority order — issues and PRs welcome:
+
+- **Containerized end-to-end harness**: a docker-compose fleet with a mocked
+  `nvidia-smi` so the SSH runner and scheduler are exercised end to end in CI.
+- **PyPI releases**: `pip install super-gpu`, semantic versions, a changelog.
+- **Per-process utilization attribution**: NVML accounting so shared-node
+  gating can distinguish managed jobs from other users' load.
+- **Completion notifications**: webhooks (Slack, Feishu, generic HTTP) on
+  terminal job and plan states.
+- **Prometheus `/metrics`**: a first-class scrape endpoint for fleet and
+  queue telemetry.
+- **AMD ROCm backend**: `rocm-smi` monitoring alongside NVIDIA.
+- **Cross-plan priority and preemption**: let an urgent plan preempt
+  lower-priority managed jobs it is allowed to displace.
+
 ## Documentation
 
 | Document | Contents |
@@ -494,8 +551,9 @@ python3 -m pytest
 ```
 
 CI runs the test suite on Python 3.10, 3.11, and 3.12 for every push and pull
-request. Bug reports and pull requests are welcome — please include a failing
-test or a reproduction where possible, and run the suite before submitting.
+request. Bug reports and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and how to propose
+changes.
 
 ## License
 
