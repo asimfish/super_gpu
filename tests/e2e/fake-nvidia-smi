@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Fake nvidia-smi for end-to-end tests.
+
+Answers the two query forms super_gpu's monitor issues:
+
+  nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,\
+memory.free,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits
+  nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory \
+--format=csv,noheader,nounits
+
+GPU state comes from FAKE_GPU_STATE (JSON) when present, otherwise two idle
+24 GiB GPUs. The state file may also carry a "processes" list to simulate
+other users' workloads.
+"""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ.get("FAKE_GPU_STATE", "/etc/fake-gpu/state.json")
+
+DEFAULT_STATE = {
+    "gpus": [
+        {
+            "index": 0,
+            "uuid": "GPU-e2e-00000000",
+            "name": "NVIDIA Fake GPU 24GB",
+            "utilization": 0,
+            "memory_used": 0,
+            "memory_total": 24576,
+            "temperature": 35,
+            "power": 61.5,
+        },
+        {
+            "index": 1,
+            "uuid": "GPU-e2e-00000001",
+            "name": "NVIDIA Fake GPU 24GB",
+            "utilization": 0,
+            "memory_used": 0,
+            "memory_total": 24576,
+            "temperature": 34,
+            "power": 60.2,
+        },
+    ],
+    "processes": [],
+}
+
+
+def load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError):
+        return DEFAULT_STATE
+
+
+def main() -> int:
+    args = " ".join(sys.argv[1:])
+    state = load_state()
+    if "--query-gpu=" in args:
+        for gpu in state.get("gpus", []):
+            used = int(gpu.get("memory_used", 0))
+            total = int(gpu.get("memory_total", 24576))
+            print(
+                "{index}, {uuid}, {name}, {util}, {used}, {free}, {total}, "
+                "{temp}, {power:.2f}".format(
+                    index=int(gpu.get("index", 0)),
+                    uuid=gpu.get("uuid", "GPU-e2e-unknown"),
+                    name=gpu.get("name", "NVIDIA Fake GPU"),
+                    util=int(gpu.get("utilization", 0)),
+                    used=used,
+                    free=total - used,
+                    total=total,
+                    temp=int(gpu.get("temperature", 30)),
+                    power=float(gpu.get("power", 50.0)),
+                )
+            )
+        return 0
+    if "--query-compute-apps=" in args:
+        for proc in state.get("processes", []):
+            print(
+                "{uuid}, {pid}, {name}, {mem}".format(
+                    uuid=proc.get("gpu_uuid", "GPU-e2e-unknown"),
+                    pid=int(proc.get("pid", 0)),
+                    name=proc.get("process_name", "python"),
+                    mem=int(proc.get("used_gpu_memory", 0)),
+                )
+            )
+        return 0
+    print("fake nvidia-smi: unsupported invocation", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

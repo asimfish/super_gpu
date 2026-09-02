@@ -512,15 +512,14 @@ including how to report a vulnerability: [SECURITY.md](SECURITY.md).
 - New jobs verify process identity with a token plus `/proc` start ticks; jobs
   still running from before an upgrade are supervised in PID-only
   compatibility mode until they finish.
-- Real multi-server SSH/GPU end-to-end validation requires live server
-  credentials and is exercised outside CI.
+- CI exercises the full SSH path against docker nodes with a fake
+  `nvidia-smi` (`tests/test_e2e_docker.py`); validation on real NVIDIA
+  hardware still requires live server credentials.
 
 ## Roadmap
 
 Planned directions, roughly in priority order — issues and PRs welcome:
 
-- **Containerized end-to-end harness**: a docker-compose fleet with a mocked
-  `nvidia-smi` so the SSH runner and scheduler are exercised end to end in CI.
 - **PyPI releases**: `pip install super-gpu`, semantic versions, a changelog.
 - **Per-process utilization attribution**: NVML accounting so shared-node
   gating can distinguish managed jobs from other users' load.
@@ -548,10 +547,13 @@ Planned directions, roughly in priority order — issues and PRs welcome:
 ```bash
 python3 -m pip install -e ".[dev]"
 python3 -m pytest
+
+# full SSH end-to-end path against docker "GPU nodes" (needs a docker daemon)
+SUPER_GPU_E2E=1 python3 -m pytest tests/test_e2e_docker.py -v
 ```
 
-CI runs the test suite on Python 3.10, 3.11, and 3.12 for every push and pull
-request. Bug reports and pull requests are welcome — see
+CI runs the unit suite on Python 3.10, 3.11, and 3.12, plus the docker-based
+SSH end-to-end job, for every push and pull request. Bug reports and pull requests are welcome — see
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and how to propose
 changes.
 

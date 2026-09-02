@@ -407,13 +407,12 @@ super-gpu --config config.json serve --host 0.0.0.0
 - 显存历史峰值在并置任务场景是保守估计，宁可少放任务也避免 OOM。
 - 单个 SQLite 数据库只允许一个活动调度控制器；这正是防止双重调度的安全约束。
 - 新任务使用 token + `/proc` start ticks 验证进程身份；升级前仍在运行的旧 handle 以 PID-only 兼容模式监管到结束。
-- 真实多服务器 SSH/GPU 端到端验证需要实际服务器凭据，在 CI 之外进行。
+- CI 已通过 docker 节点 + 假 `nvidia-smi` 覆盖完整 SSH 链路（`tests/test_e2e_docker.py`）；真实 NVIDIA 硬件上的验证仍需实际服务器凭据。
 
 ## 路线图
 
 按大致优先级排列的规划方向——欢迎 issue 和 PR：
 
-- **容器化端到端测试**：docker-compose 模拟节点 + mock `nvidia-smi`，让 SSH runner 和调度器在 CI 里跑通完整链路。
 - **发布到 PyPI**：`pip install super-gpu`、语义化版本、变更日志。
 - **按进程归因利用率**：接入 NVML accounting，让共享机准入能区分受管任务与他人负载。
 - **完成通知**：任务/计划进入终态时推送 webhook（Slack、飞书、通用 HTTP）。
@@ -437,9 +436,12 @@ super-gpu --config config.json serve --host 0.0.0.0
 ```bash
 python3 -m pip install -e ".[dev]"
 python3 -m pytest
+
+# 基于 docker「GPU 节点」的完整 SSH 端到端链路（需要 docker daemon）
+SUPER_GPU_E2E=1 python3 -m pytest tests/test_e2e_docker.py -v
 ```
 
-CI 会在 Python 3.10、3.11、3.12 上对每次 push 和 pull request 运行测试。欢迎提交 issue 和 PR——环境搭建、约定与提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+CI 会在 Python 3.10、3.11、3.12 上对每次 push 和 pull request 运行单元测试，并额外运行基于 docker 的 SSH 端到端任务。欢迎提交 issue 和 PR——环境搭建、约定与提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 

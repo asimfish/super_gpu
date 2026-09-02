@@ -23,6 +23,13 @@ To explore the dashboard without GPU servers:
 python3 scripts/demo_dashboard.py
 ```
 
+To run the SSH end-to-end suite locally (real ssh into docker containers
+that carry a fake `nvidia-smi`; needs a running docker daemon):
+
+```bash
+SUPER_GPU_E2E=1 python3 -m pytest tests/test_e2e_docker.py -v
+```
+
 ## Before You Open a PR
 
 1. Run the full suite: `python -m pytest`. CI runs it on Python 3.10, 3.11,
