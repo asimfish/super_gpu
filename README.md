@@ -16,7 +16,7 @@ backfilling freed GPUs without human intervention. It is designed to be handed
 directly to an AI agent: point the agent at this repository, give it your
 server list and experiment plan, and it can run the whole campaign.
 
-![super_gpu dashboard — live fleet view](docs/assets/dashboard-fleet.png)
+![super_gpu dashboard — live fleet view](https://raw.githubusercontent.com/asimfish/super_gpu/main/docs/assets/dashboard-fleet.png)
 
 <sub>Reproducible without any GPU server: `python3 scripts/demo_dashboard.py`
 seeds a simulated three-node cluster and serves the real dashboard on top of
@@ -185,7 +185,8 @@ Every screenshot in this README comes from that command.
 
 Requirements: Python 3.10+ on the controller host; NVIDIA GPUs with
 `nvidia-smi` on the target servers, reachable non-interactively through
-aliases in `~/.ssh/config`.
+aliases in `~/.ssh/config`. The core has no third-party runtime
+dependencies; `[mcp]` adds the MCP server.
 
 ```bash
 git clone https://github.com/asimfish/super_gpu.git
@@ -347,7 +348,7 @@ cancellations are assigned by the scheduler itself. Jobs whose dependency
 predicate can never be satisfied are marked `skipped` with result state
 `dependency_skipped` instead of `failed`, and the skip cascades downstream.
 
-![Experiment queue with live pending reasons and scheduler events](docs/assets/dashboard-queue.png)
+![Experiment queue with live pending reasons and scheduler events](https://raw.githubusercontent.com/asimfish/super_gpu/main/docs/assets/dashboard-queue.png)
 
 ### Declared Outputs
 

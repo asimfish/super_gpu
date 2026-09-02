@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .api import serve
 from .client import SuperGPUClient
 from .config import import_gpumgr_inventory, load_config, load_plan
@@ -243,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="super-gpu",
         description="Resource-aware multi-server GPU experiment scheduler",
     )
+    parser.add_argument("--version", action="version", version=f"super-gpu {__version__}")
     parser.add_argument(
         "--config",
         default=os.environ.get("SUPER_GPU_CONFIG", "config.json"),

@@ -10,7 +10,7 @@
 
 `super_gpu` 持续采集每张卡的显存、GPU 利用率、温度、功耗和进程信息，按照服务器角色与任务资源需求自动放置实验，并全程监管——自动续租、失败重试、在 GPU 释放后立即回填新任务。它天生为交给 AI Agent 使用而设计：把仓库链接、服务器列表和实验计划交给 Agent，它就能跑完整个实验批次。
 
-![super_gpu Dashboard——实时集群视图](docs/assets/dashboard-fleet.png)
+![super_gpu Dashboard——实时集群视图](https://raw.githubusercontent.com/asimfish/super_gpu/main/docs/assets/dashboard-fleet.png)
 
 <sub>无需任何 GPU 服务器即可复现上图：`python3 scripts/demo_dashboard.py`
 会构造一个三节点模拟集群并在其上运行真实 Dashboard，见[先试玩](#先试玩无需-gpu)。</sub>
@@ -127,7 +127,7 @@ python3 scripts/demo_dashboard.py
 
 ### 真实集群
 
-要求：控制机 Python 3.10+；目标服务器为 NVIDIA GPU，安装 `nvidia-smi`，并可通过 `~/.ssh/config` 中的别名免交互连接。
+要求：控制机 Python 3.10+；目标服务器为 NVIDIA GPU，安装 `nvidia-smi`，并可通过 `~/.ssh/config` 中的别名免交互连接。核心零第三方运行时依赖；`[mcp]` 额外安装 MCP 服务。
 
 ```bash
 git clone https://github.com/asimfish/super_gpu.git
@@ -276,7 +276,7 @@ PYTHONUNBUFFERED=1
 `cancelled` 由调度器自行判定。依赖谓词永远无法满足的任务会被标记为
 `skipped`（结果状态 `dependency_skipped`）而非 `failed`，并级联到更下游。
 
-![实验队列：实时 pending 原因与调度事件](docs/assets/dashboard-queue.png)
+![实验队列：实时 pending 原因与调度事件](https://raw.githubusercontent.com/asimfish/super_gpu/main/docs/assets/dashboard-queue.png)
 
 ### 声明式产物
 

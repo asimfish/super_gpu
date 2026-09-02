@@ -63,3 +63,29 @@ Do not open public issues for vulnerabilities; follow
 For anything that changes scheduling semantics, persistence, or the security
 model, open an issue first and reference the relevant ADR in `docs/adr/`.
 New significant decisions should come with a new ADR in the same format.
+
+## Cutting a Release (maintainers)
+
+Releases are driven by version tags; `.github/workflows/release.yml` builds,
+checks, publishes to PyPI through Trusted Publishing, and creates the GitHub
+release with generated notes.
+
+One-time setup on PyPI (no token is ever stored): on the `super-gpu` project
+page, add a GitHub publisher with owner `asimfish`, repository `super_gpu`,
+workflow `release.yml`, environment `pypi`. For the very first release use
+PyPI's "pending publisher" form, which reserves the name at the same time.
+
+Per release:
+
+1. Set `__version__` in `super_gpu/__init__.py` (this is the single source;
+   the workflow refuses a tag that disagrees with it).
+2. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new
+   `## [X.Y.Z] - YYYY-MM-DD` heading and commit.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+Local dry run before tagging:
+
+```bash
+python3 -m pip install build twine
+python3 -m build && python3 -m twine check --strict dist/*
+```

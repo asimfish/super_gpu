@@ -1,6 +1,60 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "super-gpu"
+dynamic = ["version"]
+description = "Agent-ready, resource-aware multi-server GPU experiment scheduler"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "super_gpu contributors" }]
+requires-python = ">=3.10"
+keywords = ["gpu", "scheduler", "experiments", "nvidia", "mcp", "agent", "ssh", "cluster"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.12,<2"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/asimfish/super_gpu"
+Repository = "https://github.com/asimfish/super_gpu"
+Issues = "https://github.com/asimfish/super_gpu/issues"
+Changelog = "https://github.com/asimfish/super_gpu/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/asimfish/super_gpu#readme"
+
+[project.scripts]
+super-gpu = "super_gpu.cli:main"
+super-gpu-mcp = "super_gpu.mcp_server:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "super_gpu.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["super_gpu", "super_gpu.*"]
+
+[tool.setuptools.package-data]
+super_gpu = ["web/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
