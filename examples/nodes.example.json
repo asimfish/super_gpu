@@ -41,5 +41,26 @@
         "cooldown_seconds": 20
       }
     }
+  ],
+  "notifications": [
+    {
+      "name": "team-feishu",
+      "kind": "feishu",
+      "url_env": "SUPER_GPU_FEISHU_WEBHOOK",
+      "secret_env": "SUPER_GPU_FEISHU_SECRET",
+      "events": ["plan_completed", "plan_failed", "plan_cancelled", "job_failed"]
+    },
+    {
+      "name": "lab-slack",
+      "kind": "slack",
+      "url_env": "SUPER_GPU_SLACK_WEBHOOK"
+    },
+    {
+      "name": "pipeline",
+      "kind": "generic",
+      "url_env": "SUPER_GPU_WEBHOOK_URL",
+      "events": ["*"],
+      "headers": {"X-Source": "super_gpu"}
+    }
   ]
 }

@@ -34,6 +34,7 @@ it. See [Try It First](#try-it-first-no-gpus-required).</sub>
 - [Resource Estimation](#resource-estimation)
 - [MCP Server](#mcp-server)
 - [Idle-GPU Watchdog](#idle-gpu-watchdog)
+- [Notifications](#notifications)
 - [REST API](#rest-api)
 - [Security](#security)
 - [Current Limitations](#current-limitations)
@@ -86,6 +87,8 @@ it. See [Try It First](#try-it-first-no-gpus-required).</sub>
   [JSON Schema](schemas/experiment-plan.schema.json) for plans.
 - **Live dashboard**: a zero-CDN web UI showing every server, GPU, lease, job
   queue, and scheduler event in real time.
+- **Push notifications**: plan and job outcomes delivered to Feishu, Slack,
+  or any HTTP endpoint, so nobody has to poll.
 
 ## Why super_gpu?
 
@@ -470,6 +473,49 @@ SQLite; stale samples are discarded rather than counting controller downtime
 as idleness. Treat `cancel_managed` as destructive authority — see
 [SECURITY.md](SECURITY.md).
 
+## Notifications
+
+Instead of polling, let the controller push scheduler events to Feishu,
+Slack, or any HTTP endpoint. Webhooks are declared in `config.json`:
+
+```json
+"notifications": [
+  {"name": "team-feishu", "kind": "feishu",
+   "url_env": "SUPER_GPU_FEISHU_WEBHOOK", "secret_env": "SUPER_GPU_FEISHU_SECRET"},
+  {"name": "lab-slack", "kind": "slack", "url_env": "SUPER_GPU_SLACK_WEBHOOK"},
+  {"name": "pipeline", "kind": "generic", "url": "https://ci.example.com/hooks/super-gpu",
+   "events": ["*"], "headers": {"Authorization": "Bearer ..."}}
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `feishu` (custom bot, optional signing `secret`), `slack` (incoming webhook), or `generic` (full JSON envelope) |
+| `url` / `url_env` | the endpoint, or the environment variable holding it; an unset variable disables the target instead of failing validation |
+| `events` | scheduler event kinds to forward; `["*"]` for everything. Default: `plan_completed`, `plan_failed`, `plan_cancelled`, `job_failed` |
+| `headers`, `timeout` | extra request headers and per-request timeout in seconds |
+
+A chat webhook URL is a credential: prefer `url_env`, and note that
+`/api/state`, `validate`, and `doctor` only ever expose the host, never the
+URL or secret. Delivery runs on a background thread with bounded retries, so
+an unreachable endpoint never slows a scheduling tick; a delivery that finally
+fails is recorded as a `notification_failed` event (which is itself never
+forwarded). The generic envelope is:
+
+```json
+{"source": "super_gpu", "version": "0.2.0", "event": "plan_completed",
+ "message": "plan ablation completed: 5 completed, 1 skipped",
+ "created_at": 1756800000.0,
+ "payload": {"plan_id": "plan-...", "name": "ablation", "status": "completed",
+             "total_jobs": 6, "job_counts": {"completed": 5, "skipped": 1}}}
+```
+
+Plan-level events (`plan_completed`, `plan_failed`, `plan_cancelled`) fire
+exactly once, when the last job of a plan reaches a terminal state; every
+other kind in `GET /api/events` (`job_started`, `job_failed`, `job_retry`,
+`node_offline`, `watchdog_anomaly_detected`, ...) can be subscribed to the
+same way.
+
 ## REST API
 
 | Method | Endpoint | Purpose |
@@ -524,8 +570,6 @@ Planned directions, roughly in priority order — issues and PRs welcome:
 - **PyPI releases**: `pip install super-gpu`, semantic versions, a changelog.
 - **Per-process utilization attribution**: NVML accounting so shared-node
   gating can distinguish managed jobs from other users' load.
-- **Completion notifications**: webhooks (Slack, Feishu, generic HTTP) on
-  terminal job and plan states.
 - **Prometheus `/metrics`**: a first-class scrape endpoint for fleet and
   queue telemetry.
 - **AMD ROCm backend**: `rocm-smi` monitoring alongside NVIDIA.

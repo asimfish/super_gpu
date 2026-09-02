@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .models import (
     RESULT_STATES,
@@ -226,12 +226,25 @@ def _intent_digest(plan: ExperimentPlan) -> str:
     return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
 
 
+TERMINAL_PLAN_STATES = {"completed", "failed", "cancelled"}
+
+
 class StateStore:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_lock = threading.Lock()
+        self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._initialize()
+
+    def add_event_listener(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Receive every recorded event after it is committed.
+
+        Listeners run on the caller's thread and must return quickly; any
+        exception they raise is swallowed so observers can never break the
+        scheduler.
+        """
+        self._event_listeners.append(callback)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -983,11 +996,27 @@ class StateStore:
         return [dict(row) for row in rows]
 
     def add_event(self, kind: str, message: str, payload: dict[str, Any] | None = None) -> None:
+        created = now_ts()
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO events(kind, message, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (kind, message, _json(payload or {}), now_ts()),
+                (kind, message, _json(payload or {}), created),
             )
+            event_id = cursor.lastrowid
+        if not self._event_listeners:
+            return
+        event = {
+            "id": event_id,
+            "kind": kind,
+            "message": message,
+            "payload": dict(payload or {}),
+            "created_at": created,
+        }
+        for listener in list(self._event_listeners):
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - observers must never break the store
+                pass
 
     def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -1004,26 +1033,52 @@ class StateStore:
     def refresh_plan_for_job(self, job_id: str) -> None:
         with self.connect() as conn:
             row = conn.execute("SELECT plan_id FROM jobs WHERE id=?", (job_id,)).fetchone()
-            if row:
-                self._refresh_plan(conn, row["plan_id"])
+            transition = self._refresh_plan(conn, row["plan_id"]) if row else None
+        if transition:
+            self._announce_plan_transition(transition)
 
-    def refresh_all_plans(self) -> None:
+    def refresh_all_plans(self) -> list[dict[str, Any]]:
+        """Recompute every plan's status; return plans that just became terminal."""
+        transitions: list[dict[str, Any]] = []
         with self.connect() as conn:
             ids = [row["id"] for row in conn.execute("SELECT id FROM plans").fetchall()]
             for plan_id in ids:
-                self._refresh_plan(conn, plan_id)
+                transition = self._refresh_plan(conn, plan_id)
+                if transition:
+                    transitions.append(transition)
+        for transition in transitions:
+            self._announce_plan_transition(transition)
+        return transitions
+
+    def _announce_plan_transition(self, transition: dict[str, Any]) -> None:
+        counts = transition["job_counts"]
+        summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
+        self.add_event(
+            f"plan_{transition['status']}",
+            f"plan {transition['name']} {transition['status']}: {summary}",
+            transition,
+        )
 
     @staticmethod
-    def _refresh_plan(conn: sqlite3.Connection, plan_id: str) -> None:
+    def _refresh_plan(conn: sqlite3.Connection, plan_id: str) -> dict[str, Any] | None:
+        """Update one plan's derived status.
+
+        Returns a transition record the first time the plan reaches a terminal
+        state, and None otherwise. finished_at is written once and preserved.
+        """
+        current = conn.execute(
+            "SELECT id, name, status, finished_at FROM plans WHERE id=?", (plan_id,)
+        ).fetchone()
+        if current is None:
+            return None
         statuses = [
             row["status"]
             for row in conn.execute("SELECT status FROM jobs WHERE plan_id=?", (plan_id,)).fetchall()
         ]
         if not statuses:
-            return
+            return None
         if all(status == "completed" for status in statuses):
             status = "completed"
-            finished = now_ts()
         elif all(
             status in {"completed", "failed", "cancelled", "skipped"}
             for status in statuses
@@ -1036,17 +1091,35 @@ class StateStore:
                 status = "cancelled"
             else:
                 status = "completed"
-            finished = now_ts()
         elif any(status in {"starting", "running", "cancelling"} for status in statuses):
             status = "running"
-            finished = None
         else:
             status = "queued"
-            finished = None
+        terminal = status in TERMINAL_PLAN_STATES
+        previous = str(current["status"])
+        if status == previous and (not terminal or current["finished_at"] is not None):
+            return None
+        finished = None
+        if terminal:
+            finished = current["finished_at"] if current["finished_at"] is not None else now_ts()
         conn.execute(
             "UPDATE plans SET status=?, updated_at=?, finished_at=? WHERE id=?",
             (status, now_ts(), finished, plan_id),
         )
+        if not terminal or previous in TERMINAL_PLAN_STATES:
+            return None
+        counts: dict[str, int] = {}
+        for item in statuses:
+            counts[item] = counts.get(item, 0) + 1
+        return {
+            "plan_id": plan_id,
+            "name": str(current["name"]),
+            "status": status,
+            "previous_status": previous,
+            "finished_at": finished,
+            "total_jobs": len(statuses),
+            "job_counts": counts,
+        }
 
     def acquire_controller(self, owner: str, ttl: float) -> bool:
         timestamp = now_ts()

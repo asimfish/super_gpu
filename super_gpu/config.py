@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .models import ExperimentPlan, SystemConfig, NodeConfig
+from .models import ExperimentPlan, NodeConfig, SystemConfig, WebhookConfig
 
 
 def _read_json(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -20,6 +20,13 @@ def _read_json(path: str | os.PathLike[str]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{resolved} must contain a JSON object")
     return payload
+
+
+def _webhooks(data: dict[str, Any]) -> list[WebhookConfig]:
+    raw = data.get("notifications") or []
+    if not isinstance(raw, list):
+        raise ValueError("notifications must be a list of webhook objects")
+    return [WebhookConfig.from_dict(dict(item)) for item in raw]
 
 
 def load_config(path: str | os.PathLike[str]) -> SystemConfig:
@@ -40,6 +47,7 @@ def load_config(path: str | os.PathLike[str]) -> SystemConfig:
             or data.get("api_token")
             or ""
         ),
+        notifications=_webhooks(data),
     )
     cfg.database = str(Path(cfg.database).expanduser())
     cfg.validate()
@@ -120,6 +128,7 @@ def config_from_dict(data: dict[str, Any]) -> SystemConfig:
         api_host=str(data.get("api_host") or "127.0.0.1"),
         api_port=int(data.get("api_port", 8765)),
         api_token=str(data.get("api_token") or ""),
+        notifications=_webhooks(data),
     )
     cfg.database = str(Path(cfg.database).expanduser())
     cfg.validate()

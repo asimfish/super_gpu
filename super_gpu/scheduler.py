@@ -22,6 +22,7 @@ from .models import (
     new_id,
 )
 from .monitor import ClusterMonitor
+from .notify import Notifier
 from .placement import PlacementEngine
 from .runner import PersistentRunner
 from .source_snapshot import SourceSnapshotStore
@@ -66,6 +67,7 @@ class Scheduler:
         estimator: ResourceEstimator | None = None,
         placement: PlacementEngine | None = None,
         guardian: IdleGpuGuardian | None = None,
+        notifier: Notifier | None = None,
     ) -> None:
         self.config = config
         self.store = store or StateStore(config.database)
@@ -77,6 +79,11 @@ class Scheduler:
         self.estimator = estimator or ResourceEstimator(config, self.store)
         self.placement = placement or PlacementEngine(config, self.monitor)
         self.guardian = guardian or IdleGpuGuardian()
+        self.notifier = notifier or Notifier.from_config(config)
+        if self.notifier.on_failure is None:
+            self.notifier.on_failure = self._notification_failed
+        if self.notifier.active:
+            self.store.add_event_listener(self.notifier.handle_event)
         # Idle accumulation must survive controller restarts; the guardian's
         # stale-gap handling keeps the blind window from counting as idle time.
         self.guardian.restore_observations(self.store.load_watchdog_observations())
@@ -113,10 +120,27 @@ class Scheduler:
         )
         self._thread.start()
 
+    def _notification_failed(self, target: Any, event: dict[str, Any], error: str) -> None:
+        self.store.add_event(
+            "notification_failed",
+            f"webhook {target.name} did not accept event {event.get('kind')}: {error[:200]}",
+            {
+                "webhook": target.name,
+                "kind": target.kind,
+                "event_kind": event.get("kind"),
+                "event_id": event.get("id"),
+                "error": error[-2000:],
+            },
+        )
+
     def stop(self, timeout: float = 10.0) -> None:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=max(0.1, timeout))
+        # Let queued notifications (for example the final plan_completed) go
+        # out before the process exits.
+        self.notifier.flush(timeout=min(10.0, max(0.1, timeout)))
+        self.notifier.close(timeout=1.0)
         if not self._thread or not self._thread.is_alive():
             self.store.release_controller(self.owner)
         else:

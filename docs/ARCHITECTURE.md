@@ -49,6 +49,9 @@ credentials and connection topology remain in the operator's `~/.ssh/config`.
 - `StateStore`: persists plans, jobs, leases, telemetry, and audit events.
 - `SourceSnapshotStore`: builds deterministic source archives and addresses
   them by SHA-256 digest.
+- `Notifier`: observes the store's committed event stream and posts selected
+  events to configured webhooks from a background worker with bounded
+  retries; it never blocks a tick and never forwards its own failures.
 - REST/MCP adapters: expose typed scheduling and inspection operations to
   local agents and operators.
 

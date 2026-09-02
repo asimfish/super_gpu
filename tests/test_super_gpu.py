@@ -28,6 +28,7 @@ from super_gpu.models import (
     Placement,
     ResourceEstimate,
     RunnerHandle,
+    WebhookConfig,
 )
 from super_gpu.monitor import ClusterMonitor, parse_nvidia_output, redact_command
 from super_gpu.placement import PlacementEngine
@@ -1064,6 +1065,83 @@ def test_scheduler_backfills_newly_available_gpu(tmp_path):
     assert [job["status"] for job in jobs].count("completed") == 1
     assert [job["status"] for job in jobs].count("running") == 1
     assert any(event["kind"] == "job_started" for event in store.list_events())
+    store.release_controller(scheduler.owner)
+
+
+def test_plan_terminal_event_fires_once_and_finished_at_is_preserved(tmp_path):
+    config = _config(tmp_path, default_memory=4096, max_parallel=2)
+    store = StateStore(config.database)
+    runner = FakeRunner()
+    scheduler = Scheduler(config, store=store, monitor=FakeMonitor([_snapshot()]), runner=runner)
+    submitted = scheduler.submit(
+        ExperimentPlan.from_dict(
+            {
+                "name": "terminal",
+                "max_parallel": 2,
+                "jobs": [
+                    {"name": "a", "command": "echo a"},
+                    {"name": "b", "command": "echo b"},
+                ],
+            }
+        )
+    )
+    scheduler.run_once()
+    runner.finish_all()
+    scheduler.run_once()
+    plan = store.get_plan(submitted["id"])
+    assert plan["status"] == "running", "one job is still to be placed, plan must not be terminal"
+
+    scheduler.run_once()
+    runner.finish_all()
+    scheduler.run_once()
+    plan = store.get_plan(submitted["id"])
+    assert plan["status"] == "completed"
+    finished_at = plan["finished_at"]
+    assert finished_at is not None
+
+    time.sleep(0.01)
+    scheduler.run_once()
+    scheduler.run_once()
+    assert store.get_plan(submitted["id"])["finished_at"] == finished_at
+
+    plan_events = [e for e in store.list_events(limit=200) if e["kind"].startswith("plan_completed")]
+    assert len(plan_events) == 1
+    assert plan_events[0]["payload"]["job_counts"] == {"completed": 2}
+    assert plan_events[0]["payload"]["plan_id"] == submitted["id"]
+    assert "2 completed" in plan_events[0]["message"]
+    store.release_controller(scheduler.owner)
+
+
+def test_scheduler_forwards_events_to_configured_webhook(tmp_path):
+    from super_gpu.notify import Notifier
+
+    delivered = []
+
+    def fake_deliver(target, body):
+        delivered.append((target.name, json.loads(body)))
+
+    config = _config(tmp_path)
+    config.notifications = [
+        WebhookConfig(url="https://example.invalid/hook", name="hook", events=("plan_completed",))
+    ]
+    store = StateStore(config.database)
+    runner = FakeRunner()
+    notifier = Notifier(config.notifications, retry_delays=(), deliver_fn=fake_deliver)
+    scheduler = Scheduler(
+        config, store=store, monitor=FakeMonitor([_snapshot()]), runner=runner, notifier=notifier
+    )
+    scheduler.submit(
+        ExperimentPlan.from_dict({"name": "notify", "jobs": [{"name": "a", "command": "echo a"}]})
+    )
+    scheduler.run_once()
+    runner.finish_all()
+    scheduler.run_once()
+    assert notifier.flush(timeout=10)
+    notifier.close()
+
+    assert [name for name, _ in delivered] == ["hook"]
+    assert delivered[0][1]["event"] == "plan_completed"
+    assert delivered[0][1]["payload"]["job_counts"] == {"completed": 1}
     store.release_controller(scheduler.owner)
 
 

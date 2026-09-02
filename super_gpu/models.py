@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 
 TERMINAL_JOB_STATES = {"completed", "failed", "cancelled", "skipped"}
@@ -156,6 +158,99 @@ class NodeConfig:
         return data
 
 
+WEBHOOK_KINDS = {"generic", "slack", "feishu"}
+# Scheduler event kinds a webhook receives when it does not list its own.
+DEFAULT_NOTIFICATION_EVENTS = (
+    "plan_completed",
+    "plan_failed",
+    "plan_cancelled",
+    "job_failed",
+)
+
+
+@dataclass
+class WebhookConfig:
+    """One outbound notification target.
+
+    The URL of a chat webhook is itself a credential, so it may be supplied
+    indirectly through ``url_env``; a target whose variable is unset is kept
+    but disabled instead of failing config validation.
+    """
+
+    url: str = ""
+    url_env: str = ""
+    kind: str = "generic"
+    name: str = ""
+    events: tuple[str, ...] = DEFAULT_NOTIFICATION_EVENTS
+    secret: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    timeout: float = 10.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], *, environ: dict[str, str] | None = None) -> "WebhookConfig":
+        env = environ if environ is not None else dict(os.environ)
+        url_env = str(data.get("url_env") or "").strip()
+        url = str(data.get("url") or "").strip()
+        if not url and url_env:
+            url = env.get(url_env, "").strip()
+        raw_events = data.get("events")
+        if raw_events is None:
+            events: tuple[str, ...] = DEFAULT_NOTIFICATION_EVENTS
+        elif isinstance(raw_events, str):
+            events = (raw_events,)
+        else:
+            events = tuple(str(item) for item in raw_events)
+        secret = str(data.get("secret") or "").strip()
+        secret_env = str(data.get("secret_env") or "").strip()
+        if not secret and secret_env:
+            secret = env.get(secret_env, "").strip()
+        target = cls(
+            url=url,
+            url_env=url_env,
+            kind=str(data.get("kind") or "generic").lower(),
+            name=str(data.get("name") or url_env or data.get("kind") or "webhook").strip(),
+            events=events,
+            secret=secret,
+            headers={str(k): str(v) for k, v in (data.get("headers") or {}).items()},
+            timeout=float(data.get("timeout", 10.0)),
+        )
+        target.validate()
+        return target
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    def validate(self) -> None:
+        if not self.url and not self.url_env:
+            raise ValueError(f"webhook {self.name!r}: url or url_env is required")
+        if self.url and not self.url.lower().startswith(("http://", "https://")):
+            raise ValueError(f"webhook {self.name!r}: url must be http(s)")
+        if self.kind not in WEBHOOK_KINDS:
+            raise ValueError(f"webhook {self.name!r}: kind must be one of {sorted(WEBHOOK_KINDS)}")
+        if not self.events:
+            raise ValueError(f"webhook {self.name!r}: events must not be empty")
+        if self.timeout <= 0:
+            raise ValueError(f"webhook {self.name!r}: timeout must be positive")
+
+    def accepts(self, kind: str) -> bool:
+        return "*" in self.events or kind in self.events
+
+    def public_dict(self) -> dict[str, Any]:
+        host = urlsplit(self.url).netloc if self.url else ""
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "enabled": self.enabled,
+            "host": host,
+            "url_env": self.url_env,
+            "events": list(self.events),
+            "signed": bool(self.secret),
+            "header_keys": sorted(self.headers),
+            "timeout": self.timeout,
+        }
+
+
 @dataclass
 class SystemConfig:
     nodes: list[NodeConfig]
@@ -168,6 +263,7 @@ class SystemConfig:
     api_host: str = "127.0.0.1"
     api_port: int = 8765
     api_token: str = ""
+    notifications: list[WebhookConfig] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.nodes:
@@ -185,6 +281,8 @@ class SystemConfig:
             raise ValueError("max_parallel must be positive")
         for node in self.nodes:
             node.validate()
+        for webhook in self.notifications:
+            webhook.validate()
 
     def node(self, name: str) -> NodeConfig:
         for node in self.nodes:
@@ -204,6 +302,7 @@ class SystemConfig:
             "api_host": self.api_host,
             "api_port": self.api_port,
             "api_token_configured": bool(self.api_token),
+            "notifications": [w.public_dict() for w in self.notifications],
         }
 
 

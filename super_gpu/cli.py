@@ -65,6 +65,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "ok": ok,
             "database": str(store.path),
             "nodes": [snapshot.as_dict() for snapshot in snapshots],
+            "notifications": [webhook.public_dict() for webhook in cfg.notifications],
         }
     )
     return 0 if ok else 2

@@ -27,6 +27,7 @@
 - [资源估算](#资源估算)
 - [MCP 服务](#mcp-服务)
 - [异常占用巡检](#异常占用巡检)
+- [完成通知](#完成通知)
 - [REST API](#rest-api)
 - [安全](#安全)
 - [当前边界](#当前边界)
@@ -50,6 +51,7 @@
 - **强任务身份**：runner 同时校验 launch token、PID 与 Linux 进程启动时钟，拒绝向 PID 复用后的无关进程发信号。
 - **Agent 优先接口**：同时提供 CLI、REST 和 MCP；仓库内置 [`AGENTS.md`](AGENTS.md) 操作契约与实验计划 [JSON Schema](schemas/experiment-plan.schema.json)。
 - **实时前端**：无外部 CDN 依赖的 Dashboard，实时展示全部服务器、GPU、租约、实验队列与调度事件。
+- **主动推送**：计划与任务结果推送到飞书、Slack 或任意 HTTP 端点，不用任何人轮询。
 
 ## 为什么选 super_gpu
 
@@ -373,6 +375,39 @@ export SUPER_GPU_WATCHDOG_ACTION=cancel_managed
 
 自动取消仍需同时满足最短运行时间、连续低利用率宽限期、显存阈值、可见 GPU 进程和独占租约。watchdog 观察状态持久化在 SQLite 中；过长采样间隔会按陈旧状态处理，不会把 controller 离线时间误计为持续空闲。把 `cancel_managed` 当作破坏性权限对待——详见 [SECURITY.md](SECURITY.md)。
 
+## 完成通知
+
+不必轮询：让 controller 把调度事件推送到飞书、Slack 或任意 HTTP 端点。在 `config.json` 中声明 webhook：
+
+```json
+"notifications": [
+  {"name": "team-feishu", "kind": "feishu",
+   "url_env": "SUPER_GPU_FEISHU_WEBHOOK", "secret_env": "SUPER_GPU_FEISHU_SECRET"},
+  {"name": "lab-slack", "kind": "slack", "url_env": "SUPER_GPU_SLACK_WEBHOOK"},
+  {"name": "pipeline", "kind": "generic", "url": "https://ci.example.com/hooks/super-gpu",
+   "events": ["*"], "headers": {"Authorization": "Bearer ..."}}
+]
+```
+
+| 字段 | 作用 |
+|---|---|
+| `kind` | `feishu`（自定义机器人，可选 `secret` 签名）、`slack`（incoming webhook）或 `generic`（完整 JSON 信封） |
+| `url` / `url_env` | 端点地址，或存放地址的环境变量名；变量未设置时该目标自动禁用而非校验失败 |
+| `events` | 要转发的调度事件类型，`["*"]` 表示全部。默认：`plan_completed`、`plan_failed`、`plan_cancelled`、`job_failed` |
+| `headers`、`timeout` | 额外请求头与单次请求超时（秒） |
+
+聊天机器人的 webhook 地址本身就是凭据：建议用 `url_env`；`/api/state`、`validate` 和 `doctor` 只会暴露主机名，绝不输出 URL 或 secret。投递在后台线程执行、有限次重试，端点不可达也不会拖慢调度 tick；最终失败会记为 `notification_failed` 事件（该事件本身永不转发，避免回环）。generic 信封格式：
+
+```json
+{"source": "super_gpu", "version": "0.2.0", "event": "plan_completed",
+ "message": "plan ablation completed: 5 completed, 1 skipped",
+ "created_at": 1756800000.0,
+ "payload": {"plan_id": "plan-...", "name": "ablation", "status": "completed",
+             "total_jobs": 6, "job_counts": {"completed": 5, "skipped": 1}}}
+```
+
+计划级事件（`plan_completed`、`plan_failed`、`plan_cancelled`）在计划最后一个任务到达终态时**只触发一次**；`GET /api/events` 中的其他所有事件类型（`job_started`、`job_failed`、`job_retry`、`node_offline`、`watchdog_anomaly_detected` 等）都可以同样订阅。
+
 ## REST API
 
 | Method | Endpoint | 作用 |
@@ -415,7 +450,6 @@ super-gpu --config config.json serve --host 0.0.0.0
 
 - **发布到 PyPI**：`pip install super-gpu`、语义化版本、变更日志。
 - **按进程归因利用率**：接入 NVML accounting，让共享机准入能区分受管任务与他人负载。
-- **完成通知**：任务/计划进入终态时推送 webhook（Slack、飞书、通用 HTTP）。
 - **Prometheus `/metrics`**：一等公民的集群与队列指标抓取端点。
 - **AMD ROCm 后端**：在 NVIDIA 之外支持 `rocm-smi` 监控。
 - **跨计划优先级与抢占**：允许紧急计划抢占它有权置换的低优先级受管任务。

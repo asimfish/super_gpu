@@ -48,8 +48,17 @@ release (planned as `v0.2.0`, matching `super_gpu.__version__`).
 - Packaging: PEP 621 metadata in `pyproject.toml`, single-sourced version,
   `super-gpu --version`, a packaging check in CI, and a tag-driven PyPI
   release workflow using Trusted Publishing.
+- Webhook notifications (`notifications` in `config.json`): Feishu (with
+  optional signing), Slack, and generic JSON targets receive selected
+  scheduler events from a background worker with bounded retries; URLs may
+  come from environment variables and are never exposed by the API.
+- Plan-level events `plan_completed`, `plan_failed`, and `plan_cancelled`,
+  emitted exactly once when a plan reaches a terminal state, with per-status
+  job counts.
 
 ### Fixed
+- A plan's `finished_at` was rewritten on every scheduler tick; it is now set
+  once when the plan becomes terminal.
 - A job that finished between the liveness check and the `/proc` start-ticks
   read was reported as lost with an identity mismatch (Linux only).
 - GPU process detail panels stayed collapsed across dashboard refreshes.
