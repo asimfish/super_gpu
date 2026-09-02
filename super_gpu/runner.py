@@ -130,23 +130,46 @@ if [ -n "${SUPER_GPU_LAUNCH_TOKEN:-}" ]; then
     exit 0
   fi
 fi
+state=""
 if [ -f "$run_dir/exit_code" ]; then
-  rc=$(tr -d '[:space:]' < "$run_dir/exit_code")
-  echo "__SUPER_GPU_STATE__ finished"
-  echo "__SUPER_GPU_EXIT__ ${rc:-255}"
+  state=finished
 elif kill -0 "$pid" 2>/dev/null; then
   current_ticks=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)
-  if [ -n "${SUPER_GPU_LAUNCH_TOKEN:-}" ] && [ "${current_ticks:-0}" != "$SUPER_GPU_PROCESS_START_TICKS" ]; then
+  # An empty read means /proc is unavailable or the process exited between the
+  # liveness check and this read; neither is evidence of a different process.
+  if [ -n "${SUPER_GPU_LAUNCH_TOKEN:-}" ] && [ -n "$current_ticks" ] && [ "$current_ticks" != "$SUPER_GPU_PROCESS_START_TICKS" ]; then
+    state=mismatch
+  else
+    state=running
+  fi
+else
+  state=lost
+fi
+# The wrapper may have written exit_code while the checks above were running.
+# Only the wrapper (verified above) writes that file, so its presence settles
+# the outcome regardless of what the probes observed.
+if [ "$state" != "finished" ] && [ -f "$run_dir/exit_code" ]; then
+  state=finished
+fi
+case "$state" in
+  finished)
+    rc=$(tr -d '[:space:]' < "$run_dir/exit_code")
+    echo "__SUPER_GPU_STATE__ finished"
+    echo "__SUPER_GPU_EXIT__ ${rc:-255}"
+    ;;
+  running)
+    echo "__SUPER_GPU_STATE__ running"
+    ;;
+  mismatch)
     echo "__SUPER_GPU_STATE__ lost"
     echo "__SUPER_GPU_EXIT__ 255"
     echo "__SUPER_GPU_ERROR__ process identity start time mismatch"
-  else
-    echo "__SUPER_GPU_STATE__ running"
-  fi
-else
-  echo "__SUPER_GPU_STATE__ lost"
-  echo "__SUPER_GPU_EXIT__ 255"
-fi
+    ;;
+  *)
+    echo "__SUPER_GPU_STATE__ lost"
+    echo "__SUPER_GPU_EXIT__ 255"
+    ;;
+esac
 echo "__SUPER_GPU_STDOUT__"
 tail -n 100 "$run_dir/stdout.log" 2>/dev/null || true
 echo "__SUPER_GPU_STDERR__"

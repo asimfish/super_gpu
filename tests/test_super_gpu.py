@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -1187,6 +1189,96 @@ def test_local_persistent_runner_writes_logs(tmp_path):
     assert status is not None
     assert status.exit_code == 0
     assert "hello-super" in status.stdout_tail
+
+
+def test_poll_reports_finished_when_wrapper_exits_during_identity_probe(tmp_path, monkeypatch):
+    """Regression: a job that finished between the liveness check and the
+    /proc start-ticks read used to be reported as lost with an identity
+    mismatch (only reproducible on Linux, where /proc exists).
+
+    An awk shim stands in for the wrapper finishing at exactly that moment:
+    it writes exit_code and yields no ticks, like reading /proc of a process
+    that has just exited.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "stdout.log").write_text("hello-super\n", encoding="utf-8")
+    (run_dir / "stderr.log").write_text("", encoding="utf-8")
+    token = "ab" * 24
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        (run_dir / "identity").write_text(f"{token}\n{sleeper.pid}\n12345\n1.0\n", encoding="utf-8")
+        shim_dir = tmp_path / "bin"
+        shim_dir.mkdir()
+        awk_shim = shim_dir / "awk"
+        awk_shim.write_text(
+            "#!/bin/sh\n"
+            'printf "0\\n" > "$SUPER_GPU_RUN_DIR/exit_code"\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        awk_shim.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+        node = NodeConfig.from_dict(
+            {"name": "local", "ssh": "local", "role": "dedicated", "workspace": str(tmp_path)}
+        )
+        handle = RunnerHandle(
+            kind="local",
+            node="local",
+            pid=sleeper.pid,
+            run_dir=str(run_dir),
+            started_at=1.0,
+            launch_token=token,
+            process_start_ticks=12345,
+        )
+        status = PersistentRunner().poll(node, handle)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+    assert status.state == "finished", status
+    assert status.exit_code == 0
+    assert status.error == ""
+    assert "hello-super" in status.stdout_tail
+
+
+def test_poll_still_rejects_live_process_with_different_start_ticks(tmp_path, monkeypatch):
+    """A live process whose /proc start time differs from the recorded one is
+    a recycled PID and must stay 'lost' even after the exit-race fix."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    token = "cd" * 24
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        (run_dir / "identity").write_text(f"{token}\n{sleeper.pid}\n12345\n1.0\n", encoding="utf-8")
+        shim_dir = tmp_path / "bin"
+        shim_dir.mkdir()
+        awk_shim = shim_dir / "awk"
+        awk_shim.write_text("#!/bin/sh\necho 99999\n", encoding="utf-8")
+        awk_shim.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+        node = NodeConfig.from_dict(
+            {"name": "local", "ssh": "local", "role": "dedicated", "workspace": str(tmp_path)}
+        )
+        handle = RunnerHandle(
+            kind="local",
+            node="local",
+            pid=sleeper.pid,
+            run_dir=str(run_dir),
+            started_at=1.0,
+            launch_token=token,
+            process_start_ticks=12345,
+        )
+        status = PersistentRunner().poll(node, handle)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+    assert status.state == "lost", status
+    assert status.exit_code == 255
+    assert "start time mismatch" in status.error
 
 
 def test_runner_executes_captured_snapshot_and_refuses_wrong_identity(tmp_path):
