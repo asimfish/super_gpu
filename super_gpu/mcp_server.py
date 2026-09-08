@@ -11,7 +11,14 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     FastMCP = None  # type: ignore[assignment]
 
+from urllib.parse import urlencode
+
+from .api_manifest import LOG_LINES_DEFAULT, LOG_LINES_MAX, WAIT_TIMEOUT_MAX_SECONDS
 from .client import SuperGPUClient
+
+
+def _dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def create_mcp(
@@ -32,12 +39,49 @@ def create_mcp(
     @mcp.tool()
     def cluster_snapshot() -> str:
         """Return live server/GPU utilization, leases, running jobs, and scheduler health."""
-        return json.dumps(client.get("/api/state"), ensure_ascii=False, indent=2)
+        return _dumps(client.get("/api/state"))
 
     @mcp.tool()
     def scheduler_status() -> str:
         """Return scheduler heartbeat and queue counts."""
-        return json.dumps(client.get("/api/scheduler"), ensure_ascii=False, indent=2)
+        return _dumps(client.get("/api/scheduler"))
+
+    @mcp.tool()
+    def experiment_brief(hours: float = 6.0, format: str = "text") -> str:
+        """One-screen situation brief: controller health, attention items (failures, blocked
+        jobs, offline nodes, idle-yet-occupied GPUs), queue, free capacity, changes in the
+        window, and recommendations. Use this first when supervising. format: text | json."""
+        if format == "json":
+            return _dumps(client.get(f"/api/brief?hours={float(hours):g}"))
+        return client.get_text(f"/api/brief?hours={float(hours):g}&format=text")
+
+    @mcp.tool()
+    def capacity_query(
+        gpus: int = 1,
+        memory_mib: int = 0,
+        nodes: str = "",
+        labels: str = "",
+    ) -> str:
+        """Dry-run placement: how many jobs needing `gpus` GPUs and `memory_mib` MiB per GPU
+        (0 = estimate) could start right now, and on which GPUs. Observation only, not a
+        reservation. `nodes`/`labels` are comma-separated constraints."""
+        query = {"gpus": str(int(gpus))}
+        if memory_mib:
+            query["memory_mib"] = str(int(memory_mib))
+        if nodes:
+            query["nodes"] = nodes
+        if labels:
+            query["labels"] = labels
+        return _dumps(client.get(f"/api/capacity?{urlencode(query)}"))
+
+    @mcp.tool()
+    def plan_preview(plan_json: str) -> str:
+        """Validate a plan and show, per job, its resource estimate and whether it would
+        start now (and where) or queue (and why). Nothing is submitted."""
+        plan = json.loads(plan_json)
+        if not isinstance(plan, dict):
+            raise ValueError("plan_json must contain a JSON object")
+        return _dumps(client.post("/api/plans/preview", {"plan": plan}))
 
     @mcp.tool()
     def experiment_submit(plan_json: str, request_id: str) -> str:
@@ -45,20 +89,21 @@ def create_mcp(
         plan = json.loads(plan_json)
         if not isinstance(plan, dict):
             raise ValueError("plan_json must contain a JSON object")
-        return json.dumps(
-            client.post("/api/plans", {"plan": plan, "request_id": request_id}),
-            ensure_ascii=False,
-            indent=2,
+        return _dumps(client.post("/api/plans", {"plan": plan, "request_id": request_id}))
+
+    @mcp.tool()
+    def experiment_wait(plan_id: str, timeout_seconds: float = 60.0) -> str:
+        """Block until the plan is terminal or `timeout_seconds` (max 300) elapse; the answer
+        carries `terminal` and the plan either way. Prefer this over polling in a loop."""
+        timeout = max(0.0, min(float(timeout_seconds), WAIT_TIMEOUT_MAX_SECONDS))
+        return _dumps(
+            client.get(f"/api/plans/{plan_id}/wait?timeout={timeout:g}", timeout=timeout + 30)
         )
 
     @mcp.tool()
     def experiment_status(plan_id: str) -> str:
         """Return one plan and all of its jobs, placements, estimates, and logs."""
-        return json.dumps(
-            client.get(f"/api/plans/{plan_id}"),
-            ensure_ascii=False,
-            indent=2,
-        )
+        return _dumps(client.get(f"/api/plans/{plan_id}"))
 
     @mcp.tool()
     def experiment_jobs(status: str = "", limit: int = 200) -> str:
@@ -66,39 +111,38 @@ def create_mcp(
         query = f"?limit={limit}"
         if status:
             query += f"&status={status}"
-        return json.dumps(client.get(f"/api/jobs{query}"), ensure_ascii=False, indent=2)
+        return _dumps(client.get(f"/api/jobs{query}"))
 
     @mcp.tool()
-    def experiment_cancel(job_id: str) -> str:
-        """Request graceful cancellation of a queued or running job."""
-        return json.dumps(
-            client.post(f"/api/jobs/{job_id}/cancel"),
-            ensure_ascii=False,
-            indent=2,
-        )
+    def experiment_logs(job_id: str, lines: int = LOG_LINES_DEFAULT) -> str:
+        """Fetch the last `lines` lines (max 5000) of a job's stdout and stderr from the
+        node that ran it, plus its result.json and exit code when finished."""
+        lines = max(1, min(int(lines), LOG_LINES_MAX))
+        return _dumps(client.get(f"/api/jobs/{job_id}/logs?lines={lines}"))
 
     @mcp.tool()
     def experiment_outputs(job_id: str) -> str:
         """List a finished job's declared output files (expanded on the node, no transfer)."""
-        return json.dumps(
-            client.get(f"/api/jobs/{job_id}/outputs"),
-            ensure_ascii=False,
-            indent=2,
-        )
+        return _dumps(client.get(f"/api/jobs/{job_id}/outputs"))
 
     @mcp.tool()
-    def scheduler_events(limit: int = 100) -> str:
-        """Return recent placement, completion, retry, and controller events."""
-        return json.dumps(
-            client.get(f"/api/events?limit={limit}"),
-            ensure_ascii=False,
-            indent=2,
-        )
+    def experiment_cancel(job_id: str) -> str:
+        """Request graceful cancellation of a queued or running job."""
+        return _dumps(client.post(f"/api/jobs/{job_id}/cancel"))
+
+    @mcp.tool()
+    def scheduler_events(limit: int = 100, since: float = 0.0) -> str:
+        """Return recent placement, completion, retry, and controller events, optionally
+        only those created after `since` (epoch seconds)."""
+        query = f"?limit={limit}"
+        if since:
+            query += f"&since={float(since):g}"
+        return _dumps(client.get(f"/api/events{query}"))
 
     @mcp.tool()
     def anomaly_report() -> str:
         """Return sustained idle-GPU findings and the active watchdog policy."""
-        return json.dumps(client.get("/api/anomalies"), ensure_ascii=False, indent=2)
+        return _dumps(client.get("/api/anomalies"))
 
     return mcp
 

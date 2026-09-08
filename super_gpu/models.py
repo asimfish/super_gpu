@@ -613,6 +613,40 @@ class GpuSnapshot:
         data["processes"] = [asdict(p) for p in self.processes]
         return data
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GpuSnapshot":
+        processes = []
+        for raw in data.get("processes") or []:
+            processes.append(
+                GpuProcess(
+                    pid=int(raw.get("pid") or 0),
+                    process_name=str(raw.get("process_name") or ""),
+                    used_memory_mib=int(raw.get("used_memory_mib") or 0),
+                    user=str(raw.get("user") or ""),
+                    command=str(raw.get("command") or ""),
+                    elapsed_seconds=(
+                        int(raw["elapsed_seconds"])
+                        if raw.get("elapsed_seconds") is not None
+                        else None
+                    ),
+                    cwd=str(raw.get("cwd") or ""),
+                )
+            )
+        return cls(
+            index=int(data.get("index") or 0),
+            uuid=str(data.get("uuid") or ""),
+            name=str(data.get("name") or ""),
+            utilization=int(data.get("utilization") or 0),
+            memory_used_mib=int(data.get("memory_used_mib") or 0),
+            memory_free_mib=int(data.get("memory_free_mib") or 0),
+            memory_total_mib=int(data.get("memory_total_mib") or 0),
+            temperature_c=(
+                int(data["temperature_c"]) if data.get("temperature_c") is not None else None
+            ),
+            power_w=float(data["power_w"]) if data.get("power_w") is not None else None,
+            processes=processes,
+        )
+
 
 @dataclass
 class NodeSnapshot:
@@ -634,6 +668,19 @@ class NodeSnapshot:
             "collected_at": self.collected_at,
             "latency_ms": round(self.latency_ms, 1),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NodeSnapshot":
+        """Rebuild a snapshot persisted by ``StateStore.save_snapshots``."""
+        return cls(
+            node=str(data.get("node") or ""),
+            role=str(data.get("role") or "shared"),
+            reachable=bool(data.get("reachable", False)),
+            gpus=[GpuSnapshot.from_dict(dict(gpu)) for gpu in data.get("gpus") or []],
+            error=str(data.get("error") or ""),
+            collected_at=float(data.get("collected_at") or 0.0),
+            latency_ms=float(data.get("latency_ms") or 0.0),
+        )
 
 
 @dataclass

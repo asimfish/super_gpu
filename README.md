@@ -27,6 +27,7 @@ it. See [Try It First](#try-it-first-no-gpus-required).</sub>
 - [Highlights](#highlights)
 - [Why super_gpu?](#why-super_gpu)
 - [Hand It to an Agent](#hand-it-to-an-agent)
+- [Agent Workflow](#agent-workflow)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Node Policy](#node-policy)
@@ -85,6 +86,22 @@ it. See [Try It First](#try-it-first-no-gpus-required).</sub>
 - **Agent-first interfaces**: CLI, REST, and MCP, plus an in-repo
   [`AGENTS.md`](AGENTS.md) operating contract and a
   [JSON Schema](schemas/experiment-plan.schema.json) for plans.
+- **Self-describing API**: public `GET /api/meta` lists every route with its
+  access tier, the stable error-code catalog, the MCP tools, and capability
+  flags; every error body carries a machine-readable `code`, and `/healthz`
+  versus `/readyz` tells "alive" from "has scheduled at least once" apart.
+- **Situation brief**: `GET /api/brief` (or `super-gpu brief`) is the whole
+  supervision check on one screen — controller health, what needs a decision
+  (failures with OOM hints, blocked jobs grouped by cause, offline nodes,
+  idle-yet-occupied GPUs), queue, free capacity, changes in the window, and
+  concrete recommendations.
+- **Know before you submit**: `GET /api/capacity` dry-runs the real placement
+  engine ("how many 2-GPU 40 GiB jobs could start now, and where?") and
+  `POST /api/plans/preview` explains, per job, whether it would start now,
+  queue, or never fit the fleet — nothing is written.
+- **Wait and logs instead of polling loops**: bounded long-poll
+  `/api/plans/<id>/wait`, and `/api/jobs/<id>/logs` tails stdout/stderr from
+  the node that ran the job on demand.
 - **Live dashboard**: a zero-CDN web UI showing every server, GPU, lease, job
   queue, and scheduler event in real time.
 - **Push notifications**: plan and job outcomes delivered to Feishu, Slack,
@@ -118,9 +135,11 @@ The in-repo contract instructs the agent to:
    marking every node `dedicated` (yours) or `shared` (other users present).
 3. Validate the plan and check SSH, workspaces, and `nvidia-smi`.
 4. Start or reuse a long-running controller and dashboard.
-5. Submit the plan and supervise status and scheduler events until every job
-   reaches a terminal state.
-6. Let the controller backfill freshly freed, stabilized GPUs on later scans —
+5. Preview the plan against live capacity, then submit it with a stable
+   `request_id`.
+6. Supervise with `wait` and the situation brief until every job reaches a
+   terminal state, pulling logs for anything that fails.
+7. Let the controller backfill freshly freed, stabilized GPUs on later scans —
    no manual GPU picking.
 
 A ready-to-send prompt:
@@ -137,6 +156,70 @@ the repository URL never grants credentials. For a program that has never run
 before, no system can know its exact memory footprint from the command line
 alone: declare a budget for the first run or accept the conservative
 heuristic, and the historical peak takes over afterwards.
+
+## Agent Workflow
+
+Every question an agent asks while running a campaign has one bounded call.
+The CLI forms below talk to a running controller (`--url` or
+`SUPER_GPU_URL`); the same operations exist as REST routes and MCP tools.
+
+| Question | Call |
+|---|---|
+| What does this controller support? | `super-gpu api /api/meta` — routes, tiers, error codes, MCP tools, limits |
+| Is it alive and scheduling? | `GET /healthz`, `GET /readyz` (503 with `not_ready` until the first tick) |
+| How much could I start right now? | `super-gpu capacity --gpus 2 --memory-mib 40960` |
+| Will this plan run, and where? | `super-gpu preview plan.json` |
+| Submit (retry-safe) | `super-gpu submit plan.json --request-id sweep-001` |
+| Block until it finishes | `super-gpu wait <plan-id> [--timeout 3600]` — exit 0 completed, 1 failed, 3 timeout |
+| What needs my attention? | `super-gpu brief` (text) or `super-gpu brief --json` |
+| Why did a job fail? | `super-gpu logs <job-id> --lines 300 --text` |
+| Collect artifacts | `super-gpu pull <job-id> --dest ./outputs` |
+
+A typical loop:
+
+```bash
+export SUPER_GPU_URL=http://127.0.0.1:8765
+super-gpu preview plan.json            # fits_fleet / would_start_now per job, warnings
+super-gpu submit plan.json --request-id sweep-001
+until super-gpu wait plan-abc --timeout 600; do   # returns 3 while still running
+  super-gpu brief                      # one screen: attention, capacity, recommendations
+done
+super-gpu logs job-def --text          # for anything the brief reports as failed
+```
+
+The brief is the same document as JSON or text; the text form is one screen,
+worst first:
+
+```text
+super_gpu brief 2026-09-08T08:34:36Z | window 6h | status ATTENTION
+controller: running | tick 3s ago (#1284) | poll 5s | v0.2.0
+fleet: 3/3 nodes online | 16 GPUs: 6 leased, 5 idle, 5 busy (unmanaged)
+queue: 4 active, 3 pending | window: 2 completed, 1 failed | plans active: 1
+  llm-scaling-ablation [plan-22f28d958820]: running | 2 completed, 3 pending, 4 running
+
+attention (2): 0 critical, 2 warning, 0 info
+   ! job lr-1e-3 failed on main-a100 (exit 1, attempt 2): RuntimeError: CUDA out of memory
+       -> CUDA OOM: declare resources.memory_mib >= 28672 for the retry
+   ! 3 pending jobs blocked by cluster max parallel (e.g. wd-sweep-0.1: cluster max_parallel (6) reached; oldest 4m)
+       -> raise max_parallel in config.json; GPUs are free
+
+capacity now: 8 slots for 1-GPU jobs (20224 MiB heuristic) | cluster max_parallel leaves 2 | effective 2
+  lab-shared-v100 (shared): 0 slots - gpu0 utilization 92% >= limit 35%; ...
+  main-4090 (dedicated): 2 slots on gpu 2,3
+  main-a100 (dedicated): 6 slots on gpu 4,5,6,7
+
+changes (6h): 1 job_failed, 2 job_completed, 7 job_started
+
+recommendations:
+  - cluster max_parallel (6) is the bottleneck while 8 GPU slots are free: raise max_parallel in config.json
+  - job lr-1e-3: CUDA OOM: declare resources.memory_mib >= 28672 for the retry
+```
+
+Capacity and preview are observations, not reservations: another submission
+may take the GPUs first, and only submitting a plan holds them. A job whose
+`fits_fleet` is false in the preview would never run on the current fleet
+(for example four GPUs on nodes with two), so fix it before submitting rather
+than discovering it through `pending_reason` later.
 
 ## Architecture
 
@@ -182,7 +265,15 @@ This seeds a simulated three-node fleet (two dedicated, one shared with other
 users' workloads), runs a small ablation plan through the real scheduler, and
 serves the dashboard at <http://127.0.0.1:8899> — completed, running, and
 pending jobs included, each pending job carrying its live `pending_reason`.
-Every screenshot in this README comes from that command.
+Every screenshot in this README comes from that command. The agent commands
+work against it too:
+
+```bash
+export SUPER_GPU_URL=http://127.0.0.1:8899
+python3 -m super_gpu.cli brief                      # one-screen situation brief
+python3 -m super_gpu.cli capacity --gpus 2 --memory-mib 40960
+python3 -m super_gpu.cli api /api/meta              # everything the API supports
+```
 
 ### Real Cluster
 
@@ -424,13 +515,21 @@ Exposed tools:
 |---|---|
 | `cluster_snapshot` | latest GPU telemetry for every node |
 | `scheduler_status` | tick, queue depth, watchdog, and lease state |
+| `experiment_brief` | one-screen situation brief (text by default, `format="json"` for the document) |
+| `capacity_query` | dry-run placement for a GPU/memory shape: slots now, and where |
+| `plan_preview` | validate a plan and preview estimates and placement without submitting |
 | `experiment_submit` | idempotent plan submission with `request_id` |
+| `experiment_wait` | block up to 300 s until a plan is terminal; returns `terminal` and the plan either way |
 | `experiment_status` | one plan with all of its jobs |
 | `experiment_jobs` | filterable job listing |
+| `experiment_logs` | last N lines of a job's stdout/stderr fetched from its node |
 | `experiment_outputs` | expand a finished job's declared outputs on its node |
 | `experiment_cancel` | cancel a single job |
-| `scheduler_events` | recent scheduling decisions and transitions |
+| `scheduler_events` | recent scheduling decisions and transitions (optionally `since` an epoch time) |
 | `anomaly_report` | idle-yet-occupied GPU findings and watchdog policy |
+
+The tool list is generated from the same manifest that `GET /api/meta`
+serves, and the test suite fails if the two — or this table — drift apart.
 
 HTTP transport is also available:
 
@@ -518,19 +617,53 @@ same way.
 
 ## REST API
 
+`GET /api/meta` is the machine-readable version of this table (plus limits
+and capability flags) and never requires the token, so an agent can discover
+a controller before authenticating. Routes marked *public* are the only
+other ones that skip the token check.
+
 | Method | Endpoint | Purpose |
 |---|---|---|
+| GET | `/api/meta` | *public* — API manifest: routes, error codes, MCP tools, limits, capability flags |
+| GET | `/healthz` | *public* — liveness: the HTTP server answers |
+| GET | `/readyz` | *public* — readiness: scheduler thread alive and at least one tick completed; 503 `not_ready` otherwise |
 | GET | `/api/state` | full cluster, job, lease, and event state for the dashboard |
-| GET | `/api/snapshot` | latest GPU snapshot |
+| GET | `/api/brief` | situation brief; `?hours=6` sets the change window, `?format=text` renders one screen |
+| GET | `/api/capacity` | dry-run placement; `?gpus=1&memory_mib=auto&nodes=a,b&labels=x&allow_colocation=false&max_slots=8` |
+| GET | `/api/snapshot` | latest GPU snapshot and active leases |
+| GET | `/api/scheduler` | scheduler heartbeat, queue counts, watchdog status |
+| GET | `/api/config` | public view of the controller configuration (no secrets) |
 | GET | `/api/plans` | list plans |
-| GET | `/api/plans/<id>` | one plan with all jobs |
 | POST | `/api/plans` | submit a plan JSON; supports top-level `request_id`, conflict → 409 |
+| POST | `/api/plans/preview` | validate a plan and preview estimates and placement without submitting |
+| GET | `/api/plans/<id>` | one plan with all jobs |
+| GET | `/api/plans/<id>/wait` | long-poll until the plan is terminal; `?timeout=30` (≤ 300 s); answer carries `terminal` |
 | GET | `/api/jobs` | query jobs (each job carries `pending_reason` and `result_state`) |
+| GET | `/api/jobs/<id>` | one job including command, stored log tails, and result |
+| GET | `/api/jobs/<id>/wait` | long-poll until the job is terminal (same parameters as the plan form) |
+| GET | `/api/jobs/<id>/logs` | last `?lines=200` (≤ 5000) lines of stdout/stderr fetched from the node that ran the job |
 | GET | `/api/jobs/<id>/outputs` | expand a finished job's declared outputs on its node |
 | POST | `/api/jobs/<id>/cancel` | cancel a job |
 | POST | `/api/scan` | refresh GPU state immediately |
-| GET | `/api/events` | scheduler events |
+| GET | `/api/events` | scheduler events; `?since=<epoch seconds>&kind=job_failed,job_retry` filter |
 | GET | `/api/anomalies` | current low-utilization occupancy and watchdog policy |
+
+Every error is `{"ok": false, "error": "<text>", "code": "<code>"}`; branch on
+`code`, never on the text:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_request` | 400 | malformed JSON, schema violation, or an out-of-range parameter |
+| `unauthorized` | 401 | API token missing or wrong |
+| `not_found` | 404 | unknown route, plan, or job |
+| `method_not_allowed` | 405 | the route exists but not for this method (`Allow` header lists the right ones) |
+| `idempotency_conflict` | 409 | `request_id` reused with different plan content |
+| `internal_error` | 500 | unexpected controller failure; see scheduler events |
+| `remote_failure` | 502 | the node could not be reached or the remote command failed |
+| `not_ready` | 503 | scheduler has not completed its first tick or is not running |
+
+`super-gpu api PATH [--data JSON]` calls any route from the shell with the
+configured URL and token, so every step of a runbook is one command.
 
 ## Security
 

@@ -31,15 +31,39 @@ grants server credentials.
 7. Give every logical submission a stable `request_id`, and reuse that exact ID
    only when retrying the same plan. Prefer immutable source execution by adding
    `source: {"mode": "snapshot", "path": "/controller/path/to/project"}`.
-8. Submit through MCP `experiment_submit`, the REST `POST /api/plans`, or:
+8. Before submitting, discover and preview: `GET /api/meta` (or
+   `super-gpu api /api/meta`) says what the controller supports;
+   `plan_preview` / `POST /api/plans/preview` / `super-gpu preview PLAN.json`
+   reports, per job, `fits_fleet`, `would_start_now`, and `blocked_by`, plus
+   warnings. A job with `fits_fleet: false` will never run on the current
+   fleet; fix its `resources`, `nodes`, or `required_labels` first (or ask the
+   user) rather than submitting and waiting. `capacity_query` /
+   `GET /api/capacity` answers how many jobs of a given shape could start now
+   when sizing `max_parallel` or a sweep.
+9. Submit through MCP `experiment_submit`, the REST `POST /api/plans`, or:
    `super-gpu submit PLAN.json --request-id ID --url http://127.0.0.1:8765`.
-9. Monitor `experiment_status`, `scheduler_events`, and the dashboard until the
-   plan is `completed`, `failed`, or `cancelled`.
-10. Report failed jobs with their exit code and stderr tail. Do not silently
-   change scientific parameters to make a failed experiment pass.
-11. Do not stop supervising immediately after submission unless the user asks
+10. Supervise with bounded waits, not tight polling loops: `experiment_wait` /
+    `GET /api/plans/<id>/wait?timeout=300` / `super-gpu wait PLAN_ID` block
+    until the plan is terminal or the timeout elapses (`terminal: false`
+    means keep waiting). Between waits, read `experiment_brief` /
+    `super-gpu brief`: it lists what needs a decision (failed jobs with OOM
+    hints, pending jobs grouped by cause, offline nodes, idle-yet-occupied
+    GPUs), free capacity, and recommendations. Use `experiment_status`,
+    `scheduler_events`, and the dashboard for detail.
+11. Report failed jobs with their exit code and stderr tail; fetch more than
+    the stored tail with `experiment_logs` / `super-gpu logs JOB_ID --lines N`.
+    Do not silently change scientific parameters to make a failed experiment
+    pass; an OOM hint in the brief is a resource change to propose, not a
+    scientific one.
+12. Do not stop supervising immediately after submission unless the user asks
     for a detached handoff. Stable capacity discovered on later scans is
-    automatically backfilled by the controller.
+    automatically backfilled by the controller. When the brief reports free
+    slots and an empty queue, that is the signal to submit the next batch.
+13. Branch on the machine-readable `code` of error responses
+    (`invalid_request`, `unauthorized`, `not_found`, `method_not_allowed`,
+    `idempotency_conflict`, `remote_failure`, `internal_error`, `not_ready`),
+    never on the English text. `GET /readyz` returns 503 `not_ready` until
+    the scheduler has completed its first tick.
 
 ## Hard rules
 
@@ -61,11 +85,19 @@ grants server credentials.
 
 ## MCP tools
 
+The list below is the manifest served by `GET /api/meta` (tested for drift).
+
 - `cluster_snapshot`
 - `scheduler_status`
+- `experiment_brief`
+- `capacity_query`
+- `plan_preview`
 - `experiment_submit`
+- `experiment_wait`
 - `experiment_status`
 - `experiment_jobs`
+- `experiment_logs`
+- `experiment_outputs`
 - `experiment_cancel`
 - `scheduler_events`
 - `anomaly_report`

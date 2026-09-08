@@ -434,6 +434,7 @@ class StateStore:
         plan_id: str | None = None,
         statuses: Iterable[str] | None = None,
         limit: int = 500,
+        finished_since: float | None = None,
     ) -> list[dict[str, Any]]:
         where: list[str] = []
         args: list[Any] = []
@@ -444,6 +445,9 @@ class StateStore:
         if status_values:
             where.append(f"status IN ({','.join('?' for _ in status_values)})")
             args.extend(status_values)
+        if finished_since is not None:
+            where.append("finished_at IS NOT NULL AND finished_at>=?")
+            args.append(float(finished_since))
         sql = "SELECT * FROM jobs"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1018,13 +1022,30 @@ class StateStore:
             except Exception:  # noqa: BLE001 - observers must never break the store
                 pass
 
-    def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_events(
+        self,
+        limit: int = 100,
+        *,
+        since: float | None = None,
+        kinds: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        args: list[Any] = []
+        if since is not None:
+            where.append("created_at>=?")
+            args.append(float(since))
+        kind_values = list(kinds or [])
+        if kind_values:
+            where.append(f"kind IN ({','.join('?' for _ in kind_values)})")
+            args.extend(kind_values)
+        sql = "SELECT * FROM events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(max(1, int(limit)))
         with self.connect() as conn:
             result = []
-            for row in conn.execute(
-                "SELECT * FROM events ORDER BY id DESC LIMIT ?",
-                (max(1, int(limit)),),
-            ).fetchall():
+            for row in conn.execute(sql, args).fetchall():
                 item = dict(row)
                 item["payload"] = _loads(item.pop("payload_json"), {})
                 result.append(item)
@@ -1148,3 +1169,13 @@ class StateStore:
                 "DELETE FROM controller_lock WHERE name='scheduler' AND owner=?",
                 (owner,),
             )
+
+    def controller_lock(self) -> dict[str, Any] | None:
+        """The live controller lock, or None when no controller holds it."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT owner, expires_at FROM controller_lock WHERE name='scheduler'"
+            ).fetchone()
+        if row is None or float(row["expires_at"]) <= now_ts():
+            return None
+        return {"owner": str(row["owner"]), "expires_at": float(row["expires_at"])}

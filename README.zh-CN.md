@@ -20,6 +20,7 @@
 - [核心特性](#核心特性)
 - [为什么选 super_gpu](#为什么选-super_gpu)
 - [直接交给 Agent](#直接交给-agent)
+- [Agent 工作流](#agent-工作流)
 - [架构](#架构)
 - [快速开始](#快速开始)
 - [节点策略](#节点策略)
@@ -50,6 +51,10 @@
 - **幂等提交**：稳定 `request_id` 与实验意图摘要同事务落库；超时重试返回原计划，相同 ID 配不同内容返回 HTTP 409。
 - **强任务身份**：runner 同时校验 launch token、PID 与 Linux 进程启动时钟，拒绝向 PID 复用后的无关进程发信号。
 - **Agent 优先接口**：同时提供 CLI、REST 和 MCP；仓库内置 [`AGENTS.md`](AGENTS.md) 操作契约与实验计划 [JSON Schema](schemas/experiment-plan.schema.json)。
+- **自描述 API**：公开的 `GET /api/meta` 列出每条路由及其访问层级、稳定的错误码目录、MCP 工具和能力标志；每个错误响应都带机器可读的 `code`；`/healthz` 与 `/readyz` 区分"进程活着"和"已经至少调度过一轮"。
+- **态势简报**：`GET /api/brief`（或 `super-gpu brief`）把整套监管检查压成一屏——controller 健康、需要决策的事项（带 OOM 提示的失败任务、按原因归组的阻塞任务、离线节点、占卡不干活的 GPU）、队列、当前可用容量、窗口内的变化，以及可直接执行的建议。
+- **提交前先知道结果**：`GET /api/capacity` 用真正的放置引擎做干跑（"现在能起几个 2 卡 40 GiB 的任务、落在哪"），`POST /api/plans/preview` 逐任务说明会立即启动、排队还是永远放不进当前集群——不写入任何状态。
+- **wait 与 logs 取代轮询**：有界长轮询 `/api/plans/<id>/wait`；`/api/jobs/<id>/logs` 按需从运行节点拉取 stdout/stderr 尾部。
 - **实时前端**：无外部 CDN 依赖的 Dashboard，实时展示全部服务器、GPU、租约、实验队列与调度事件。
 - **主动推送**：计划与任务结果推送到飞书、Slack 或任意 HTTP 端点，不用任何人轮询。
 
@@ -74,8 +79,9 @@
 2. 把服务器列表转成不会提交到 Git 的私有 `config.json`，明确标记 `dedicated`（主服务器）或 `shared`（共享服务器）。
 3. 校验实验计划并检查 SSH、工作目录和 `nvidia-smi`。
 4. 启动或复用长期运行的 controller 和 Dashboard。
-5. 提交实验，持续查看状态和调度事件，直到全部任务进入终态。
-6. 让 controller 在后续扫描中自动利用刚释放且已稳定的 GPU，无需 Agent 手工挑卡。
+5. 先对照实时容量预览计划，再用稳定的 `request_id` 提交。
+6. 用 `wait` 和态势简报持续监管到全部任务进入终态，对失败任务拉取日志。
+7. 让 controller 在后续扫描中自动利用刚释放且已稳定的 GPU，无需 Agent 手工挑卡。
 
 可以直接把下面这句话连同计划和服务器列表发给 Agent：
 
@@ -86,6 +92,63 @@ skills/super-gpu/SKILL.md，校验并编排我的实验；持续监管到所有�
 ```
 
 仍需提前保证 Agent 所在控制机能通过 SSH 访问这些服务器——仓库链接本身不提供任何凭据。对于从未运行过的任意程序，系统无法仅凭命令精确预知显存；可以首次显式填写预算，或接受保守启发值，之后会自动使用历史峰值校准。
+
+## Agent 工作流
+
+Agent 在跑一批实验时会问的每个问题，都对应一次有界调用。下面的 CLI 形式面向运行中的 controller（`--url` 或 `SUPER_GPU_URL`）；同样的操作也以 REST 路由和 MCP 工具提供。
+
+| 问题 | 调用 |
+|---|---|
+| 这个 controller 支持什么？ | `super-gpu api /api/meta`——路由、层级、错误码、MCP 工具、限制 |
+| 它活着并且在调度吗？ | `GET /healthz`、`GET /readyz`（首轮 tick 之前返回 503 `not_ready`） |
+| 现在能起多少任务？ | `super-gpu capacity --gpus 2 --memory-mib 40960` |
+| 这份计划能跑吗、落在哪？ | `super-gpu preview plan.json` |
+| 提交（可安全重试） | `super-gpu submit plan.json --request-id sweep-001` |
+| 阻塞等待结束 | `super-gpu wait <plan-id> [--timeout 3600]`——退出码 0 完成、1 失败、3 超时 |
+| 有什么需要我处理？ | `super-gpu brief`（文本）或 `super-gpu brief --json` |
+| 任务为什么失败？ | `super-gpu logs <job-id> --lines 300 --text` |
+| 回收产物 | `super-gpu pull <job-id> --dest ./outputs` |
+
+典型循环：
+
+```bash
+export SUPER_GPU_URL=http://127.0.0.1:8765
+super-gpu preview plan.json            # 逐任务的 fits_fleet / would_start_now 与警告
+super-gpu submit plan.json --request-id sweep-001
+until super-gpu wait plan-abc --timeout 600; do   # 仍在运行时返回 3
+  super-gpu brief                      # 一屏：待处理事项、容量、建议
+done
+super-gpu logs job-def --text          # 简报里报告失败的任务
+```
+
+简报的 JSON 与文本是同一份文档；文本形式一屏读完、最糟的排最前：
+
+```text
+super_gpu brief 2026-09-08T08:34:36Z | window 6h | status ATTENTION
+controller: running | tick 3s ago (#1284) | poll 5s | v0.2.0
+fleet: 3/3 nodes online | 16 GPUs: 6 leased, 5 idle, 5 busy (unmanaged)
+queue: 4 active, 3 pending | window: 2 completed, 1 failed | plans active: 1
+  llm-scaling-ablation [plan-22f28d958820]: running | 2 completed, 3 pending, 4 running
+
+attention (2): 0 critical, 2 warning, 0 info
+   ! job lr-1e-3 failed on main-a100 (exit 1, attempt 2): RuntimeError: CUDA out of memory
+       -> CUDA OOM: declare resources.memory_mib >= 28672 for the retry
+   ! 3 pending jobs blocked by cluster max parallel (e.g. wd-sweep-0.1: cluster max_parallel (6) reached; oldest 4m)
+       -> raise max_parallel in config.json; GPUs are free
+
+capacity now: 8 slots for 1-GPU jobs (20224 MiB heuristic) | cluster max_parallel leaves 2 | effective 2
+  lab-shared-v100 (shared): 0 slots - gpu0 utilization 92% >= limit 35%; ...
+  main-4090 (dedicated): 2 slots on gpu 2,3
+  main-a100 (dedicated): 6 slots on gpu 4,5,6,7
+
+changes (6h): 1 job_failed, 2 job_completed, 7 job_started
+
+recommendations:
+  - cluster max_parallel (6) is the bottleneck while 8 GPU slots are free: raise max_parallel in config.json
+  - job lr-1e-3: CUDA OOM: declare resources.memory_mib >= 28672 for the retry
+```
+
+容量与预览都是观察而非预留：别的提交可能先拿走这些卡，只有提交计划才会真正持有它们。预览里 `fits_fleet` 为 false 的任务在当前集群上永远跑不起来（比如在只有两卡的节点上要四卡），应在提交前修正，而不是事后从 `pending_reason` 里发现。
 
 ## 架构
 
@@ -125,7 +188,14 @@ cd super_gpu
 python3 scripts/demo_dashboard.py
 ```
 
-这会构造一个三节点模拟集群（两台专用、一台被其他用户占用的共享机），把一个小型消融计划跑过真实调度器，然后在 <http://127.0.0.1:8899> 提供 Dashboard——已完成、运行中、排队中的任务齐全，每个排队任务都带实时 `pending_reason`。本 README 的全部截图都出自这条命令。
+这会构造一个三节点模拟集群（两台专用、一台被其他用户占用的共享机），把一个小型消融计划跑过真实调度器，然后在 <http://127.0.0.1:8899> 提供 Dashboard——已完成、运行中、排队中的任务齐全，每个排队任务都带实时 `pending_reason`。本 README 的全部截图都出自这条命令。面向 Agent 的命令同样可以直接对着它试：
+
+```bash
+export SUPER_GPU_URL=http://127.0.0.1:8899
+python3 -m super_gpu.cli brief                      # 一屏态势简报
+python3 -m super_gpu.cli capacity --gpus 2 --memory-mib 40960
+python3 -m super_gpu.cli api /api/meta              # API 支持的一切
+```
 
 ### 真实集群
 
@@ -337,13 +407,20 @@ SUPER_GPU_URL=http://127.0.0.1:8765 \
 |---|---|
 | `cluster_snapshot` | 全部节点的最新 GPU 遥测 |
 | `scheduler_status` | tick、队列深度、watchdog 和租约状态 |
+| `experiment_brief` | 一屏态势简报（默认文本，`format="json"` 返回完整文档） |
+| `capacity_query` | 对指定 GPU 数/显存形状做放置干跑：现在能起几个、落在哪 |
+| `plan_preview` | 校验计划并预览估算与放置，不提交 |
 | `experiment_submit` | 带 `request_id` 的幂等计划提交 |
+| `experiment_wait` | 最多阻塞 300 秒直到计划进入终态；无论如何都返回 `terminal` 与计划 |
 | `experiment_status` | 单个计划及其全部 jobs |
 | `experiment_jobs` | 可过滤的任务列表 |
+| `experiment_logs` | 从运行节点拉取任务 stdout/stderr 最后 N 行 |
 | `experiment_outputs` | 在运行节点上展开已完成任务的声明产物清单 |
 | `experiment_cancel` | 取消单个任务 |
-| `scheduler_events` | 最近的调度决策与状态迁移 |
+| `scheduler_events` | 最近的调度决策与状态迁移（可用 `since` 限定起始时间） |
 | `anomaly_report` | 低利用率占卡发现与 watchdog 策略 |
+
+工具清单与 `GET /api/meta` 输出来自同一份 manifest；两者（或本表）不一致时测试会失败。
 
 也支持 HTTP 传输：
 
@@ -410,19 +487,48 @@ export SUPER_GPU_WATCHDOG_ACTION=cancel_managed
 
 ## REST API
 
+`GET /api/meta` 是这张表的机器可读版本（外加限制与能力标志），且不需要 token，Agent 可以先发现再鉴权。标注*公开*的路由是仅有的其他几条不检查 token 的路由。
+
 | Method | Endpoint | 作用 |
 |---|---|---|
+| GET | `/api/meta` | *公开*——API manifest：路由、错误码、MCP 工具、限制、能力标志 |
+| GET | `/healthz` | *公开*——存活探针：HTTP 服务有响应 |
+| GET | `/readyz` | *公开*——就绪探针：调度线程活着且至少完成一轮 tick；否则 503 `not_ready` |
 | GET | `/api/state` | Dashboard 所需的集群、任务、租约和事件全集 |
-| GET | `/api/snapshot` | 最新 GPU 快照 |
+| GET | `/api/brief` | 态势简报；`?hours=6` 设置变化窗口，`?format=text` 渲染为一屏文本 |
+| GET | `/api/capacity` | 放置干跑；`?gpus=1&memory_mib=auto&nodes=a,b&labels=x&allow_colocation=false&max_slots=8` |
+| GET | `/api/snapshot` | 最新 GPU 快照与活动租约 |
+| GET | `/api/scheduler` | 调度器心跳、队列计数、watchdog 状态 |
+| GET | `/api/config` | controller 配置的公开视图（不含机密） |
 | GET | `/api/plans` | 计划列表 |
-| GET | `/api/plans/<id>` | 计划和所有 jobs |
 | POST | `/api/plans` | 提交计划 JSON；支持顶层 `request_id`，冲突返回 409 |
+| POST | `/api/plans/preview` | 校验计划并预览估算与放置，不提交 |
+| GET | `/api/plans/<id>` | 计划和所有 jobs |
+| GET | `/api/plans/<id>/wait` | 长轮询直到计划进入终态；`?timeout=30`（≤ 300 秒）；响应含 `terminal` |
 | GET | `/api/jobs` | 查询 jobs（每条含 `pending_reason` 与 `result_state`） |
+| GET | `/api/jobs/<id>` | 单个任务，含命令、已存日志尾部与结果 |
+| GET | `/api/jobs/<id>/wait` | 长轮询直到任务进入终态（参数同计划形式） |
+| GET | `/api/jobs/<id>/logs` | 从运行节点拉取 stdout/stderr 最后 `?lines=200`（≤ 5000）行 |
 | GET | `/api/jobs/<id>/outputs` | 在运行节点上展开已完成任务的声明产物清单 |
 | POST | `/api/jobs/<id>/cancel` | 取消任务 |
 | POST | `/api/scan` | 立即刷新 GPU 状态 |
-| GET | `/api/events` | 调度事件 |
+| GET | `/api/events` | 调度事件；`?since=<epoch 秒>&kind=job_failed,job_retry` 过滤 |
 | GET | `/api/anomalies` | 当前低利用率显存占用与 watchdog 策略 |
+
+所有错误统一为 `{"ok": false, "error": "<文本>", "code": "<code>"}`；请按 `code` 分支，不要解析文本：
+
+| Code | Status | 含义 |
+|---|---|---|
+| `invalid_request` | 400 | JSON 格式错误、不符合 schema，或参数超出范围 |
+| `unauthorized` | 401 | API token 缺失或错误 |
+| `not_found` | 404 | 未知路由、计划或任务 |
+| `method_not_allowed` | 405 | 路由存在但不支持该方法（`Allow` 头列出可用方法） |
+| `idempotency_conflict` | 409 | `request_id` 被复用于不同的计划内容 |
+| `internal_error` | 500 | controller 意外失败；查看调度事件 |
+| `remote_failure` | 502 | 节点不可达或远端命令失败 |
+| `not_ready` | 503 | 调度器尚未完成首轮 tick 或未运行 |
+
+`super-gpu api PATH [--data JSON]` 用已配置的 URL 和 token 从 shell 调用任意路由，运行手册的每一步都是一条命令。
 
 ## 安全
 

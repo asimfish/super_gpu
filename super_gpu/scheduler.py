@@ -14,6 +14,7 @@ from .estimator import ResourceEstimator
 from .guardian import IdleGpuGuardian
 from .models import (
     APP_RESULT_STATES,
+    TERMINAL_JOB_STATES,
     ExperimentPlan,
     JobSpec,
     NodeSnapshot,
@@ -586,16 +587,44 @@ class Scheduler:
         return env
 
     def wait_for_plan(self, plan_id: str, timeout: float | None = None) -> dict[str, Any]:
+        """Block until the plan is terminal or ``timeout`` elapses; return it either way."""
+        return self._wait(
+            lambda: self.store.get_plan(plan_id, include_jobs=True),
+            lambda plan: plan["status"] in {"completed", "failed", "cancelled"},
+            timeout,
+            f"unknown plan {plan_id}",
+        )
+
+    def wait_for_job(self, job_id: str, timeout: float | None = None) -> dict[str, Any]:
+        """Block until the job is terminal or ``timeout`` elapses; return it either way."""
+        return self._wait(
+            lambda: self.store.get_job(job_id),
+            lambda job: job["status"] in TERMINAL_JOB_STATES,
+            timeout,
+            f"unknown job {job_id}",
+        )
+
+    def _wait(
+        self,
+        fetch: Any,
+        terminal: Any,
+        timeout: float | None,
+        missing: str,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
-            plan = self.store.get_plan(plan_id, include_jobs=True)
-            if not plan:
-                raise KeyError(f"unknown plan {plan_id}")
-            if plan["status"] in {"completed", "failed", "cancelled"}:
-                return plan
-            if deadline is not None and time.monotonic() >= deadline:
-                return plan
-            time.sleep(min(1.0, self.config.poll_interval))
+            record = fetch()
+            if not record:
+                raise KeyError(missing)
+            if terminal(record):
+                return record
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return record
+            else:
+                remaining = 1.0
+            time.sleep(max(0.05, min(1.0, self.config.poll_interval, remaining)))
 
     def status(self) -> dict[str, Any]:
         with self._state_lock:

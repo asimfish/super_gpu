@@ -10,13 +10,22 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .api import serve
-from .client import SuperGPUClient
+from .api import capacity_report, plan_preview, serve
+from .api_manifest import LOG_LINES_DEFAULT, WAIT_TIMEOUT_MAX_SECONDS, build_meta
+from .brief import DEFAULT_WINDOW_SECONDS, build_brief, render_brief
+from .capacity import CapacityRequest
+from .client import SuperGPUClient, SuperGPUError
 from .config import import_gpumgr_inventory, load_config, load_plan
-from .models import ExperimentPlan
+from .logs import fetch_job_logs
+from .models import TERMINAL_JOB_STATES, ExperimentPlan
 from .monitor import ClusterMonitor
 from .scheduler import Scheduler
-from .store import StateStore
+from .store import TERMINAL_PLAN_STATES, StateStore
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_UNHEALTHY = 2
+EXIT_TIMEOUT = 3
 
 
 def _print(value: Any, *, pretty: bool = True) -> None:
@@ -211,6 +220,150 @@ def cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_brief(args: argparse.Namespace) -> int:
+    client = _client(args)
+    hours = float(args.hours)
+    if client:
+        if args.json:
+            payload = client.get(f"/api/brief?hours={hours:g}")
+        else:
+            print(client.get_text(f"/api/brief?hours={hours:g}&format=text"), end="")
+            return 0
+    else:
+        payload = build_brief(_scheduler(args), window_seconds=hours * 3600)
+        if not args.json:
+            print(render_brief(payload), end="")
+            return 0
+    _print(payload)
+    return 0
+
+
+def cmd_capacity(args: argparse.Namespace) -> int:
+    query: dict[str, list[str]] = {"gpus": [str(args.gpus)]}
+    if args.memory_mib:
+        query["memory_mib"] = [str(args.memory_mib)]
+    if args.gpu_utilization is not None:
+        query["gpu_utilization"] = [str(args.gpu_utilization)]
+    if args.nodes:
+        query["nodes"] = [args.nodes]
+    if args.labels:
+        query["labels"] = [args.labels]
+    if args.allow_colocation:
+        query["allow_colocation"] = [args.allow_colocation]
+    if args.max_slots:
+        query["max_slots"] = [str(args.max_slots)]
+    client = _client(args)
+    if client:
+        from urllib.parse import urlencode
+
+        flat = {key: values[0] for key, values in query.items()}
+        _print(client.get(f"/api/capacity?{urlencode(flat)}"))
+        return 0
+    request = CapacityRequest.from_query(query)
+    _print({"ok": True, "capacity": capacity_report(_scheduler(args), request)})
+    return 0
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    plan_path = Path(args.plan).expanduser()
+    raw = json.loads(plan_path.read_text(encoding="utf-8"))
+    client = _client(args)
+    if client:
+        payload = client.post("/api/plans/preview", {"plan": raw})
+    else:
+        plan = ExperimentPlan.from_dict(raw)
+        payload = {"ok": True, "preview": plan_preview(_scheduler(args), plan)}
+    _print(payload)
+    return 0
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Block until a plan (or job) is terminal.
+
+    Exit 0 when it completed, 1 when it failed or was cancelled, 3 when the
+    overall timeout elapsed first. Remote waits are chained bounded
+    long-polls so a controller behind a proxy never sees a request longer
+    than WAIT_TIMEOUT_MAX_SECONDS.
+    """
+    kind = "jobs" if args.job else "plans"
+    key = "job" if args.job else "plan"
+    terminal_states = TERMINAL_JOB_STATES if args.job else TERMINAL_PLAN_STATES
+    overall = float(args.timeout) if args.timeout is not None else None
+    deadline = time.monotonic() + overall if overall is not None else None
+    client = _client(args)
+    scheduler = None if client else _scheduler(args)
+    while True:
+        remaining = (deadline - time.monotonic()) if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            remaining = 0.0
+        if client:
+            step = WAIT_TIMEOUT_MAX_SECONDS if remaining is None else min(remaining, WAIT_TIMEOUT_MAX_SECONDS)
+            payload = client.get(
+                f"/api/{kind}/{args.id}/wait?timeout={step:g}",
+                timeout=step + 30,
+            )
+            record = payload[key]
+        else:
+            step = None if remaining is None else min(remaining, WAIT_TIMEOUT_MAX_SECONDS)
+            record = (
+                scheduler.wait_for_job(args.id, timeout=step)
+                if args.job
+                else scheduler.wait_for_plan(args.id, timeout=step)
+            )
+        status = str(record.get("status"))
+        if status in terminal_states:
+            _print({"ok": status == "completed", "terminal": True, key: record})
+            return EXIT_OK if status == "completed" else EXIT_FAILED
+        if deadline is not None and time.monotonic() >= deadline:
+            _print({"ok": False, "terminal": False, "code": "timeout", key: record})
+            return EXIT_TIMEOUT
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    client = _client(args)
+    if client:
+        payload = client.get(f"/api/jobs/{args.job_id}/logs?lines={int(args.lines)}")
+        logs = payload["logs"]
+    else:
+        cfg = load_config(args.config)
+        logs = fetch_job_logs(cfg, StateStore(cfg.database), args.job_id, lines=int(args.lines))
+        payload = {"ok": True, "logs": logs}
+    if args.text:
+        print(
+            f"# job {logs.get('job_name')} [{logs.get('job_id')}] status={logs.get('status')} "
+            f"node={logs.get('node') or '-'} exit={logs.get('exit_code')} source={logs.get('source')}"
+        )
+        print(f"# --- stdout (last {logs.get('lines')} lines) ---")
+        print(logs.get("stdout", ""))
+        print(f"# --- stderr (last {logs.get('lines')} lines) ---")
+        print(logs.get("stderr", ""))
+        if logs.get("result_raw"):
+            print("# --- result.json ---")
+            print(logs["result_raw"])
+        return 0
+    _print(payload)
+    return 0
+
+
+def cmd_api(args: argparse.Namespace) -> int:
+    """Call any route of a running controller; the manifest is GET /api/meta."""
+    client = _client(args)
+    path = args.path if args.path.startswith("/") else f"/{args.path}"
+    if client is None:
+        if path == "/api/meta":
+            _print(build_meta())
+            return 0
+        raise ValueError("super-gpu api needs a running controller: pass --url or set SUPER_GPU_URL")
+    payload = None
+    if args.data:
+        payload = json.loads(args.data)
+        if not isinstance(payload, dict):
+            raise ValueError("--data must be a JSON object")
+    method = args.method or ("POST" if payload is not None else "GET")
+    _print(client.request(method, path, payload))
+    return 0
+
+
 def cmd_import_gpumgr(args: argparse.Namespace) -> int:
     output = Path(args.output).expanduser()
     if output.exists() and not args.force:
@@ -317,6 +470,61 @@ def build_parser() -> argparse.ArgumentParser:
     _remote_args(events)
     events.set_defaults(func=cmd_events)
 
+    brief = sub.add_parser(
+        "brief",
+        help="one-screen situation brief: health, attention items, queue, capacity, recommendations",
+    )
+    brief.add_argument("--hours", type=float, default=DEFAULT_WINDOW_SECONDS / 3600, help="change window")
+    brief.add_argument("--json", action="store_true", help="print the JSON document instead of text")
+    _remote_args(brief)
+    brief.set_defaults(func=cmd_brief)
+
+    capacity = sub.add_parser(
+        "capacity",
+        help="dry-run placement: how many jobs of this shape could start right now",
+    )
+    capacity.add_argument("--gpus", type=int, default=1)
+    capacity.add_argument("--memory-mib", type=int, default=0, help="per-GPU budget; 0 = estimate")
+    capacity.add_argument("--gpu-utilization", type=int, default=None)
+    capacity.add_argument("--nodes", default="", help="comma-separated node names")
+    capacity.add_argument("--labels", default="", help="comma-separated required labels")
+    capacity.add_argument("--allow-colocation", choices=["true", "false"], default="")
+    capacity.add_argument("--max-slots", type=int, default=0)
+    _remote_args(capacity)
+    capacity.set_defaults(func=cmd_capacity)
+
+    preview = sub.add_parser(
+        "preview",
+        help="validate a plan and show per-job estimates and placement without submitting",
+    )
+    preview.add_argument("plan")
+    _remote_args(preview)
+    preview.set_defaults(func=cmd_preview)
+
+    wait = sub.add_parser(
+        "wait",
+        help="block until a plan (or --job) is terminal; exit 0 completed, 1 failed, 3 timeout",
+    )
+    wait.add_argument("id")
+    wait.add_argument("--job", action="store_true", help="the ID is a job, not a plan")
+    wait.add_argument("--timeout", type=float, default=None, help="overall seconds; default: forever")
+    _remote_args(wait)
+    wait.set_defaults(func=cmd_wait)
+
+    logs = sub.add_parser("logs", help="fetch a job's stdout/stderr tail from its node")
+    logs.add_argument("job_id")
+    logs.add_argument("--lines", type=int, default=LOG_LINES_DEFAULT)
+    logs.add_argument("--text", action="store_true", help="print plain text instead of JSON")
+    _remote_args(logs)
+    logs.set_defaults(func=cmd_logs)
+
+    api = sub.add_parser("api", help="call any controller route (see GET /api/meta)")
+    api.add_argument("path", help="for example /api/meta or /api/jobs?status=failed")
+    api.add_argument("--data", default="", help="JSON object body; implies POST")
+    api.add_argument("--method", default="", help="override the HTTP method")
+    _remote_args(api)
+    api.set_defaults(func=cmd_api)
+
     import_gpumgr = sub.add_parser(
         "import-gpumgr",
         help="create a private super_gpu config from gpumgr's node inventory",
@@ -360,9 +568,12 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except KeyboardInterrupt:
         return 130
+    except SuperGPUError as exc:
+        _print(exc.as_dict())
+        return EXIT_FAILED
     except Exception as exc:  # noqa: BLE001
-        _print({"ok": False, "error": str(exc)})
-        return 1
+        _print({"ok": False, "error": str(exc), "code": "cli_error"})
+        return EXIT_FAILED
 
 
 if __name__ == "__main__":

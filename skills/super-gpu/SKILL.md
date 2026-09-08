@@ -60,6 +60,23 @@ Resolve schema, duplicate-name, dependency-cycle, workspace, SSH, and
 `nvidia-smi` failures before submission. Do not silently drop an unreachable
 server or weaken a shared-node policy.
 
+With a controller running, preview the plan against live capacity before
+submitting it:
+
+```bash
+.venv/bin/super-gpu api /api/meta --url http://127.0.0.1:8765          # what this controller supports
+.venv/bin/super-gpu capacity --gpus 1 --url http://127.0.0.1:8765      # slots that could start now
+.venv/bin/super-gpu preview /private/path/plan.json --url http://127.0.0.1:8765
+```
+
+The preview lists every job with `fits_fleet`, `would_start_now`, its
+estimate, and `blocked_by`, plus plan-level warnings. A job with
+`fits_fleet: false` cannot run on the current fleet (for example more GPUs
+than any node has); fix its resources or node constraints, or ask the user,
+before submitting. Jobs that merely queue behind `max_parallel` or
+dependencies need no change. Capacity and preview are observations, not
+reservations.
+
 ## Run continuously
 
 Prefer controller mode whenever the user wants dynamic backfill, a dashboard,
@@ -93,22 +110,38 @@ After submission:
 1. Record the returned plan ID.
 2. Record `submission.intent_digest`, `submission.replayed`, and the source
    snapshot digest. A replay must refer to the same returned plan ID.
-3. Poll MCP `experiment_status`, `experiment_jobs`, and `scheduler_events`, or
-   the equivalent CLI endpoints.
-4. Keep the controller alive and continue monitoring until every job is
+3. Wait with bounded long-polls instead of tight loops: MCP `experiment_wait`
+   (up to 300 s per call) or
+   `.venv/bin/super-gpu wait PLAN_ID --timeout 3600 --url http://127.0.0.1:8765`
+   (exit 0 completed, 1 failed or cancelled, 3 still running at the timeout).
+4. Between waits, read the brief — MCP `experiment_brief` or
+   `.venv/bin/super-gpu brief --url http://127.0.0.1:8765`. It ranks what
+   needs a decision (failed jobs with OOM hints, pending jobs grouped by
+   cause, offline nodes, idle-yet-occupied GPUs), shows free capacity, and
+   ends with recommendations. Use `experiment_status`, `experiment_jobs`, and
+   `scheduler_events` for detail.
+5. Keep the controller alive and continue monitoring until every job is
    `completed`, `failed`, or `cancelled`, unless the user explicitly asks for
    detached handoff.
-5. On pending jobs, inspect placement events before changing anything. Capacity
-   becoming available requires no manual action; the next stable scan schedules
-   eligible work.
-6. On failure, report the node, GPU indices, attempt count, exit code, and
-   stderr tail. Let configured retries run; never alter scientific parameters
-   merely to make a job pass.
-7. Cancel only when explicitly requested or when the user explicitly
+6. On pending jobs, read the brief's pending groups and `pending_reason`
+   before changing anything. Jobs waiting on capacity or dependencies need no
+   action; the next stable scan schedules eligible work. Jobs blocked by
+   `cluster max_parallel` while the brief shows free slots are a configuration
+   limit to raise with the user's approval.
+7. On failure, report the node, GPU indices, attempt count, exit code, and
+   stderr tail; fetch more than the stored tail with `experiment_logs` or
+   `.venv/bin/super-gpu logs JOB_ID --lines 300 --text --url ...`. Let
+   configured retries run; never alter scientific parameters merely to make a
+   job pass. An OOM hint is a resource budget to propose, not a scientific
+   change.
+8. Cancel only when explicitly requested or when the user explicitly
    authorized cleanup of this plan.
-8. Query `anomaly_report` during supervision. Unmanaged findings are
+9. Query `anomaly_report` during supervision. Unmanaged findings are
    report-only. Enable `cancel_managed` only when the operator explicitly
    authorizes automatic cleanup of scheduler-owned jobs.
+10. Branch on the `code` field of error responses (`not_found`,
+    `idempotency_conflict`, `remote_failure`, `not_ready`, ...), never on the
+    English text; `GET /api/meta` lists the catalog.
 
 ## Report the outcome
 

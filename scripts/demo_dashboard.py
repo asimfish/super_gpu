@@ -255,9 +255,13 @@ def main() -> None:
 
     state_dir = tempfile.mkdtemp(prefix="super-gpu-demo-")
     scheduler = seed(state_dir)
+    # Keep the real scheduler loop ticking over the canned telemetry so
+    # /readyz, the brief, and the dashboard show a live controller.
+    scheduler.start()
     server = create_server(scheduler, host=args.host, port=args.port)
     address, port = server.server_address[:2]
     print(f"[demo] simulated cluster ready - open http://{address}:{port}")
+    print(f"[demo] try: SUPER_GPU_URL=http://{address}:{port} super-gpu brief")
     print("[demo] Ctrl-C to stop")
     try:
         server.serve_forever()
@@ -266,7 +270,7 @@ def main() -> None:
     finally:
         server.shutdown()
         server.server_close()
-        scheduler.store.release_controller(scheduler.owner)
+        scheduler.stop()
         shutil.rmtree(state_dir, ignore_errors=True)
 
 

@@ -53,7 +53,29 @@ credentials and connection topology remain in the operator's `~/.ssh/config`.
   events to configured webhooks from a background worker with bounded
   retries; it never blocks a tick and never forwards its own failures.
 - REST/MCP adapters: expose typed scheduling and inspection operations to
-  local agents and operators.
+  local agents and operators. `api_manifest.py` is the single source of truth
+  for routes, access tiers, error codes, and MCP tool names; `GET /api/meta`
+  serves it and tests compare the README, `AGENTS.md`, and the MCP
+  registration against it.
+- `brief.py`: composes the situation brief (controller health, attention
+  items, queue, capacity, changes, recommendations) from projections the
+  other endpoints already serve, so it can never disagree with them.
+- `capacity.py`: dry-run placement. Walks the production `PlacementEngine`
+  with synthetic leases to answer "how many jobs of this shape could start
+  now" and to preview a plan job by job before submission. Observations only;
+  nothing is written.
+- `logs.py`: on-demand tail of a job's durable stdout/stderr from the node
+  that ran it, over the same transport as the runner.
+
+## Agent Interaction Model
+
+An agent runs a campaign through bounded calls, each answering one question:
+discover (`/api/meta`, `/readyz`), size and preview (`/api/capacity`,
+`/api/plans/preview`), submit idempotently (`/api/plans` with `request_id`),
+wait (`/api/plans/<id>/wait`, long-poll capped at 300 s), assess
+(`/api/brief`), diagnose (`/api/jobs/<id>/logs`), and collect
+(`/api/jobs/<id>/outputs`, `super-gpu pull`). Every error carries a stable
+`code`. See [ADR-0003](adr/0003-agent-facing-api-contract.md).
 
 ## Reliable Submission Boundary
 
